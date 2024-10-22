@@ -63,6 +63,16 @@ pub mod betting {
        Ok(())
    }
 
+   impl BetPool {
+      pub fn calculate_dynamic_odds(&mut self) {
+         // A simplistic odds calculation based on total bets and number of bets
+         if self.total_bets > 0 {
+            let total_bets_as_f64 = self.total_bets as f64;
+            self.odds = 1.0 / total_bets_as_f64; // Exemple logic
+         }
+      }
+   }
+
    // Function to resolve bets based on the winning outcome
    pub fn resolve_bets(ctx: Context<ResolveBets>, winning_outcome: String) -> ProgramResult {
        let bet_pool = &mut ctx.accounts.bet_pool;
