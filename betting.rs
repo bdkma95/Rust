@@ -43,17 +43,19 @@ pub mod betting {
    // Function to place a bet
    pub fn place_bet(ctx: Context<PlaceBet>, amount: u64) -> ProgramResult {
        let bet_pool = &mut ctx.accounts.bet_pool;
+       let user = &ctx.accounts.user;
 
        require!(amount > 0, BettingError::InvalidBetAmount);
 
        let new_bet = Bet {
-           user_id: *ctx.accounts.user.key,
+           user_id: *user.key,
            amount,
            outcome: bet_pool.outcome.clone(),
        };
 
        update_betting_history(ctx.accounts.update_history_context(), new_bet.clone())?;
        
+       // Add the bet to the pool
        bet_pool.bets.push(new_bet);
        bet_pool.total_bets += amount;
 
@@ -95,6 +97,12 @@ pub mod betting {
    // Function to resolve bets based on the winning outcome
    pub fn resolve_bets(ctx: Context<ResolveBets>, winning_outcome: String) -> ProgramResult {
        let bet_pool = &mut ctx.accounts.bet_pool;
+       // Ensure the pool has not been resolved already
+    require!(bet_pool.bets.len() > 0, BettingError::PoolAlreadyResolved);
+    
+    // Ensure that the admin is resolving the pool
+    require!(ctx.accounts.admin.is_signer, BettingError::Unauthorized);
+
       // Ensure that the pool is resolving the correct outcome
        require!(bet_pool.outcome == winning_outcome, BettingError::InvalidOutcome);
 
