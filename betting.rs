@@ -65,14 +65,33 @@ pub mod betting {
 
    impl BetPool {
       pub fn calculate_dynamic_odds(&mut self) {
-         // A simplistic odds calculation based on total bets and number of bets
-         if self.total_bets > 0 {
-            let total_bets_as_f64 = self.total_bets as f64;
-            self.odds = 1.0 / total_bets_as_f64; // Exemple logic
+         let mut win_bets_total: u64 = 0;
+         let mut lose_bets_total: u64 = 0;
+
+         // Separate bets based on outcome
+         for bet in &self.bets {
+            if bet.outcome == "Win" {
+               win_bets_total += bet.amount;
+            } else if bet.outcome == "Lose" {
+               lose_bets_total += bet.amount;
+            }   
+         }
+         
+         // Calculate odds based on total bets
+         let total_bets = win_bets_total + lose_bets_total;
+
+         if win_bets_total > 0 && total_bets > 0 {
+            self.odds = lose_bets_total as f64 / win_bets_total as f64; // Odds for "Win" outcome
+         } else {
+            self.odds = 1.0; // Default odds
+         }
+
+         // The odds for "Lose" outcome will be inverse of "Win" odds
+         if lose_bets_total > 0 && total_bets > 0 {
+            self.odds = win_bets_total as f64 / lose_bets_total as f64; // Odds for "Lose" outcome
          }
       }
    }
-
    // Function to resolve bets based on the winning outcome
    pub fn resolve_bets(ctx: Context<ResolveBets>, winning_outcome: String) -> ProgramResult {
        let bet_pool = &mut ctx.accounts.bet_pool;
@@ -128,7 +147,12 @@ pub struct PlaceBet<'info> {
    #[account(mut)]
    pub user: Signer<'info>,
    #[account(mut)]
+   pub user_token_account: AccountInfo<'info>, // User's token account
+   #[account(mut)]
+   pub bet_pool_token_account: AccountInfo<'info>, // Bet pool's token account
+   #[account(mut)]
    pub bet_pool: Account<'info, BetPool>,
+   pub token_program: Program<'info, Token>, // Reference to the token program
 }
 
 #[derive(Accounts)]
@@ -136,9 +160,12 @@ pub struct ResolveBets<'info> {
    #[account(mut)]
    pub admin: Signer<'info>, 
    #[account(mut)]
-   pub bet_pool: Account<'info, BetPool>,
-   #[account(mut)]
-   pub user_profile: Account<'info, UserProfile>, 
+   pub user_profile: Account<'info, UserProfile>,
+   #[account(mut)] 
+   pub bet_pool_token_account: AccountInfo<'info>, // Bet pool's token account
+   #[account(mut)] 
+   pub user_token_account: AccountInfo<'info>, // User's token account
+   pub token_program: Program<'info, Token>, // Reference to the token program
 }
 
 // Define data structures
