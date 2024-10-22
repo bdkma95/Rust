@@ -95,16 +95,18 @@ pub mod betting {
    // Function to resolve bets based on the winning outcome
    pub fn resolve_bets(ctx: Context<ResolveBets>, winning_outcome: String) -> ProgramResult {
        let bet_pool = &mut ctx.accounts.bet_pool;
-
+      // Ensure that the pool is resolving the correct outcome
        require!(bet_pool.outcome == winning_outcome, BettingError::InvalidOutcome);
 
        for bet in &bet_pool.bets {
            if bet.outcome == winning_outcome {
-               let payout = (bet.amount as f64 * bet_pool.odds) as u64; // Payout calculation
-               distribute_payout(bet.user_id, payout)?;
-
+               // Calculate payout based on odds
+               let payout = (bet.amount as f64 * bet_pool.odds) as u64;
+               // Distribute the payout to the winning user
+               distribute_payout(ctx.accounts.token_program.clone(), ctx.accounts.bet_pool_token_account.clone(), ctx.accounts.user_token_account.clone(), ctx.accounts.admin.to_account_info(), payout)?;
+               // Update user's total wins
                let mut user_profile = ctx.accounts.user_profile.load_mut()?;
-               user_profile.total_wins += payout; // Track total winnings for the profile
+               user_profile.total_wins += payout;
            }
        }
 
@@ -203,8 +205,13 @@ pub enum BettingError {
 // Add more errors as needed.
 }
 
-// Function to distribute payouts (placeholder)
-fn distribute_payout(user_id: Pubkey, amount: u64) -> ProgramResult {
-     msg!("Distributing payout of {} to user {}", amount, user_id);
-     Ok(())
+// Function to distribute payouts
+fn distribute_payout<'a>(token_program: AccountInfo<'a>, bet_pool_token_account: AccountInfo<'a>, user_token_account: AccountInfo<'a>, admin: AccountInfo<'a>, amount: u64,) -> ProgramResult {
+   let ix = spl_token::instruction::transfer(token_program.key, &bet_pool_token_account.key, &user_token_account.key, &admin.key, &[], amount,)?;
+
+   msg!("Transfering {} tokens from bet pool to user", amount);
+
+   invoke(&ix, &[token_program.clone(), bet_pool_token_account.clone(), user_token_account.clone(), admin.clone(),],)?;
+
+   Ok(())
 }
