@@ -1,5 +1,4 @@
 # Rust
-rust programs
 
 npx create-react-app solana-betting-frontend
 
