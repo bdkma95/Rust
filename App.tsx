@@ -9,7 +9,10 @@ import BettingInterface from './components/BettingInterface';
 require('@solana/wallet-adapter-react-ui/styles.css');
 
 function App() {
+  // Define the endpoint for connecting to the Solana cluster
   const endpoint = useMemo(() => clusterApiUrl('devnet'), []);
+  
+  // Define the wallets that can be used
   const wallets = useMemo(() => [new PhantomWalletAdapter()], []);
 
   return (
