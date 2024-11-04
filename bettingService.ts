@@ -1,5 +1,6 @@
-import { Program, AnchorProvider } from '@project-serum/anchor';
+import { Program, AnchorProvider, web3 } from '@project-serum/anchor';
 import { Connection, PublicKey, Transaction } from '@solana/web3.js';
+import { TOKEN_PROGRAM_ID, getAssociatedTokenAddress } from '@solana/spl-token';
 import { IDL } from '../idl/betting';
 
 export class BettingService {
@@ -11,57 +12,65 @@ export class BettingService {
     this.program = new Program(IDL, new PublicKey('YourProgramIdHere'), provider);
   }
 
-  // Create a new user profile
   async createUserProfile(userPubkey: PublicKey) {
+    const [userProfilePda] = await this.getUserProfilePDA(userPubkey);
+
     const tx = await this.program.methods
       .createUserProfile()
       .accounts({
+        userProfile: userProfilePda,
         user: userPubkey,
-        userProfile: await this.getUserProfileAccount(userPubkey),
-        systemProgram: anchor.web3.SystemProgram.programId,
+        systemProgram: web3.SystemProgram.programId,
       })
       .rpc();
 
-    console.log("User profile created with transaction:", tx);
+    return tx;
   }
 
-  // Get user profile by public key
-  async getUserProfile(userPubkey: PublicKey) {
-    const userProfileAccount = await this.getUserProfileAccount(userPubkey);
-    const userProfileData = await this.program.account.userProfile.fetch(userProfileAccount);
+  async createBettingPool(adminPubkey: PublicKey, outcome: string) {
+    const [poolPda] = await this.getBetPoolPDA(outcome);
     
-    return userProfileData;
-  }
-
-  // Place a bet on a specific pool
-  async placeBet(poolPubkey: PublicKey, amount: number, outcome: string, userPubkey: PublicKey) {
     const tx = await this.program.methods
-      .placeBet(new anchor.BN(amount), outcome)
+      .createBettingPool(outcome)
       .accounts({
-        pool: poolPubkey,
-        user: userPubkey,
-        userProfile: await this.getUserProfileAccount(userPubkey),
+        betPool: poolPda,
+        admin: adminPubkey,
+        systemProgram: web3.SystemProgram.programId,
       })
       .rpc();
 
-    console.log("Bet placed with transaction:", tx);
+    return tx;
   }
 
-  // Fetch all betting pools
-  async getBetPools() {
-    const pools = await this.connection.getProgramAccounts(this.program.programId);
-    
-    return pools.map(pool => ({
-      pubkey: pool.pubkey,
-      account: this.program.account.betPool.fetch(pool.pubkey),
-    }));
+  async placeBet(
+    userPubkey: PublicKey, 
+    poolPubkey: PublicKey, 
+    amount: number,
+    mint: PublicKey // Token mint address
+  ) {
+    const userTokenAccount = await getAssociatedTokenAddress(mint, userPubkey);
+    const poolTokenAccount = await getAssociatedTokenAddress(mint, poolPubkey);
+    const [userProfilePda] = await this.getUserProfilePDA(userPubkey);
+
+    const tx = await this.program.methods
+      .placeBet(new web3.BN(amount))
+      .accounts({
+        user: userPubkey,
+        userTokenAccount,
+        betPoolTokenAccount: poolTokenAccount,
+        betPool: poolPubkey,
+        userProfile: userProfilePda,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+
+    return tx;
   }
 
-  // Helper function to get the user's profile account address
-  private async getUserProfileAccount(userPubkey: PublicKey): Promise<PublicKey> {
-    return (await PublicKey.findProgramAddress(
-      [userPubkey.toBuffer()],
-      this.program.programId
-    ))[0];
-  }
-}
+  async resolveBets(
+    adminPubkey: PublicKey,
+    poolPubkey: PublicKey,
+    winningOutcome: string,
+    mint: PublicKey
+  ) {
+    const poolTokenAccount = await getAssociatedTokenAddress(mint, poolPubkey);
