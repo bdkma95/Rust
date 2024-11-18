@@ -1,12 +1,12 @@
 import { useWallet, useConnection } from '@solana/wallet-adapter-react';
 import { useState, useEffect } from 'react';
 import { Program, AnchorProvider, BN } from '@project-serum/anchor';
-import { Connection, PublicKey, Transaction } from '@solana/web3.js';
+import { Connection, PublicKey } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID, getAssociatedTokenAddress } from '@solana/spl-token';
 import { IDL } from '../idl/betting';
 
 const BettingInterface = () => {
-  const { publicKey, sendTransaction } = useWallet();
+  const { publicKey } = useWallet();
   const { connection } = useConnection();
   const [userProfile, setUserProfile] = useState(null);
   const [betPools, setBetPools] = useState([]);
@@ -81,7 +81,7 @@ const BettingInterface = () => {
         .accounts({
           userProfile: profilePda,
           user: publicKey,
-          systemProgram: anchor.web3.SystemProgram.programId,
+          systemProgram: web3.SystemProgram.programId,
         })
         .rpc();
       
