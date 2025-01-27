@@ -7,23 +7,27 @@ declare_id!("YourProgramID");
 pub mod antivaxxx {
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>, total_supply: u64) -> ProgramResult {
-        // Set initial token allocations
+    pub fn initialize(ctx: Context<Initialize>, total_supply: u64, cliff_duration: i64, duration: i64) -> ProgramResult {
         let user_account = &mut ctx.accounts.user_account;
+    
+        // Validate cliff duration and duration
+        if cliff_duration < 0 || duration <= 0 || cliff_duration >= duration {
+            return Err(ErrorCode::InvalidValues.into()); // Invalid cliff/duration setup
+        }
+    
         user_account.allocated_tokens = total_supply;
         user_account.vested_tokens = 0;
     
         // Mint the total supply to the user's token account
-        let authority_bump = *ctx.bumps.get("authority").unwrap(); // Get the bump seed for authority
+        let authority_bump = *ctx.bumps.get("authority").unwrap();
     
         token::mint_to(
-            ctx.accounts
-                .into_mint_to_context(authority_bump), // Pass the bump here
+            ctx.accounts.into_mint_to_context(authority_bump),
             total_supply,
         )?;
     
         Ok(())
-    }        
+    }            
 
     pub fn vest_tokens(ctx: Context<VestTokens>, amount: u64) -> ProgramResult {
         let user_account = &mut ctx.accounts.user_account;
@@ -199,6 +203,9 @@ pub enum ErrorCode {
 
     #[msg("Invalid values in vesting schedule.")]
     InvalidValues, // New error for invalid values in vesting schedule
+
+    #[msg("Overflow error in vesting schedule calculation.")]
+    OverflowError, // New error for overflow situations
 }
 
 #[event]
@@ -235,7 +242,7 @@ pub fn release_tokens(
         }
     };
 
-    // Ensure vesting schedule is valid
+    // Ensure the vesting schedule is valid
     if vesting_schedule.total_amount == 0 || vesting_schedule.duration <= 0 {
         return Err(ErrorCode::InvalidValues.into()); // Handle invalid vesting schedule data
     }
@@ -243,6 +250,7 @@ pub fn release_tokens(
     // Calculate the releasable amount of tokens
     let releasable_amount = vesting_schedule.release(current_time)?;
 
+    // If no tokens are available for release, return an error
     if releasable_amount == 0 {
         return Err(ErrorCode::NoTokensAvailable.into());
     }
@@ -253,8 +261,16 @@ pub fn release_tokens(
         return Err(ErrorCode::InsufficientBalance.into());
     }
 
+    // Ensure that the released amount doesn't exceed the total vested amount
+    if vesting_schedule.released_amount + releasable_amount > vesting_schedule.total_amount {
+        return Err(ErrorCode::InvalidValues.into()); // Release would exceed the total vested amount
+    }
+
     // Perform the transfer of tokens from 'from' account to 'to' account
     token::transfer(ctx.accounts.into_transfer_context(), releasable_amount)?;
+
+    // Update the released amount in the vesting schedule
+    vesting_schedule.released_amount = vesting_schedule.released_amount.saturating_add(releasable_amount);
 
     // Emit an event to track the release
     emit!(ReleaseTokensEvent {
@@ -326,11 +342,18 @@ impl VestingSchedule {
         let vested_amount = if elapsed_time >= self.duration {
             self.total_amount
         } else {
-            // Ensure safe multiplication and division, avoiding overflow
-            self.total_amount
+            // Safely calculate vested amount without overflow
+            let result = self.total_amount
                 .checked_mul(elapsed_time as u64)
-                .and_then(|x| x.checked_div(self.duration as u64))
-                .unwrap_or(u64::MAX) // Fall back to MAX value if overflow occurs
+                .and_then(|x| x.checked_div(self.duration as u64));
+            
+            match result {
+                Some(amount) => amount,
+                None => {
+                    // If multiplication or division results in overflow, return an error
+                    return Err(ErrorCode::OverflowError.into());
+                }
+            }
         };
 
         // Ensure that the released amount does not exceed the vested amount
