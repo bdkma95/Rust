@@ -235,6 +235,11 @@ pub fn release_tokens(
         }
     };
 
+    // Ensure vesting schedule is valid
+    if vesting_schedule.total_amount == 0 || vesting_schedule.duration <= 0 {
+        return Err(ErrorCode::InvalidValues.into()); // Handle invalid vesting schedule data
+    }
+
     // Calculate the releasable amount of tokens
     let releasable_amount = vesting_schedule.release(current_time)?;
 
