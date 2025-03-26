@@ -1,0 +1,38 @@
+[package]
+name = "rust-blockchain-backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Blockchain Dependencies
+solana-sdk = "1.17"              # Solana SDK for program interactions
+solana-client = "1.17"           # Solana RPC client
+solana-program = "1.17"          # Solana smart contract development
+substrate-api-client = "0.11"    # Substrate API client for Polkadot
+ethers = { version = "2.0", features = ["ws", "rustls"] } # Ethereum/Web3 Client
+
+# Backend API Dependencies
+axum = "0.7"                     # Lightweight async web framework
+actix-web = "4.4"                 # Actix Web for backend services
+tokio = { version = "1", features = ["full"] }  # Async runtime for networking
+
+# Serialization & Data Processing
+serde = { version = "1", features = ["derive"] } # JSON serialization
+serde_json = "1"                                  # JSON support
+
+# Performance Optimization
+rayon = "1.8"            # Parallel processing for performance
+tokio-console = "0.1"    # Monitor async tasks for performance debugging
+flamegraph = "0.2"       # Profiling tool for Rust applications
+
+# Misc Utilities
+log = "0.4"             # Logging support
+env_logger = "0.10"     # Logger for debugging
+dotenv = "0.15"         # Load environment variables from .env file
+
+[dev-dependencies]
+criterion = "0.5"       # Benchmarking library
+
+[[bench]]
+name = "performance_tests"
+harness = false
