@@ -3,36 +3,47 @@ name = "rust-blockchain-backend"
 version = "0.1.0"
 edition = "2021"
 
+# Define the library section
+[lib]
+name = "backend_lib"  # Name of the library
+path = "src/lib.rs"   # Library source file
+
+# Define the binary section
+[[bin]]
+name = "backend_app"  # Name of the binary executable
+path = "src/main.rs"  # Binary source file
+
 [dependencies]
 # Blockchain Dependencies
-solana-sdk = "1.17"              # Solana SDK for program interactions
-solana-client = "1.17"           # Solana RPC client
-solana-program = "1.17"          # Solana smart contract development
-substrate-api-client = "0.11"    # Substrate API client for Polkadot
-ethers = { version = "2.0", features = ["ws", "rustls"] } # Ethereum/Web3 Client
+solana-sdk = "1.17"
+solana-client = "1.17"
+solana-program = "1.17"
+substrate-api-client = "0.11"
+ethers = { version = "2.0", features = ["ws", "rustls"] }
 
 # Backend API Dependencies
-axum = "0.7"                     # Lightweight async web framework
-actix-web = "4.4"                 # Actix Web for backend services
-tokio = { version = "1", features = ["full"] }  # Async runtime for networking
+axum = "0.7"
+actix-web = "4.4"
+tokio = { version = "1", features = ["full"] }
 
 # Serialization & Data Processing
-serde = { version = "1", features = ["derive"] } # JSON serialization
-serde_json = "1"                                  # JSON support
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Performance Optimization
-rayon = "1.8"            # Parallel processing for performance
-tokio-console = "0.1"    # Monitor async tasks for performance debugging
-flamegraph = "0.2"       # Profiling tool for Rust applications
+rayon = "1.8"
+tokio-console = "0.1"
+flamegraph = "0.2"
 
 # Misc Utilities
-log = "0.4"             # Logging support
-env_logger = "0.10"     # Logger for debugging
-dotenv = "0.15"         # Load environment variables from .env file
+log = "0.4"
+env_logger = "0.10"
+dotenv = "0.15"
 
 [dev-dependencies]
-criterion = "0.5"       # Benchmarking library
+criterion = "0.5"
 
 [[bench]]
 name = "performance_tests"
 harness = false
+path = "benches/performance_tests.rs"
