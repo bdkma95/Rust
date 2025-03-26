@@ -50,7 +50,6 @@ dotenv = "0.15"
 
 # ⚠️ Force `zeroize` to be compatible with Solana
 [patch.crates-io]
-zeroize = "=1.3.0"
 
 # -------------------------------
 # 📌 Development Dependencies
