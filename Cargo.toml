@@ -17,12 +17,15 @@ path = "src/main.rs"
 
 # 🚀 Blockchain Libraries
 [dependencies]
-zeroize = "1.3.0"  # Explicitly pinned for Solana compatibility
+zeroize = { version = "1.3.0" }
 solana-sdk = "1.17.0"
 solana-client = "1.17.0"
 solana-program = "1.17.0"
-substrate-api-client = "0.17.0"  # Corrected version (Substrate uses 0.x versioning)
-ethers = { version = "2.0.10", features = ["ws", "rustls"] }
+substrate-api-client = "0.18.0"
+sp-core = { version = "31.0.0", default-features = false }
+ethers = { version = "2.0.14", features = ["ws", "rustls"] }
+curve25519-dalek = { version = "3.2.1", features = ["zeroize"] }
+ed25519-zebra = { git = "https://github.com/ZcashFoundation/ed25519-zebra", rev = "3b6b458" }
 
 # ⚡ Backend API Dependencies
 axum = "0.7.5"
