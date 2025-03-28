@@ -11,53 +11,28 @@ path = "src/lib.rs"
 name = "backend_app"
 path = "src/main.rs"
 
-# -------------------------------
-# 📌 Dependencies
-# -------------------------------
-
-# 🚀 Blockchain Libraries
 [dependencies]
-zeroize = { version = "1.3.0" }
+# 🟠 Solana Stack
 solana-sdk = "1.17.0"
 solana-client = "1.17.0"
 solana-program = "1.17.0"
-substrate-api-client = "0.18.0"
-sp-core = { version = "31.0.0", default-features = false }
+
+# 🔵 Substrate Stack (Compatible Versions)
+substrate-api-client = "0.16.0"
+sp-core = { version = "29.0.0", default-features = false }
+sp-runtime = "29.0.0"
+
+# 🟢 Ethereum Stack
 ethers = { version = "2.0.14", features = ["ws", "rustls"] }
-curve25519-dalek = { version = "3.2.1", features = ["zeroize"] }
-ed25519-zebra = { git = "https://github.com/ZcashFoundation/ed25519-zebra", rev = "3b6b458" }
 
-# ⚡ Backend API Dependencies
+# 🔐 Cryptography Stack
+zeroize = { version = "=1.3.0", features = ["zeroize_derive"] }
+ed25519-zebra = "3.0.0"
+
+# ⚡ Backend & Utilities
 axum = "0.7.5"
-actix-web = { version = "4.10.2", default-features = false }
 tokio = { version = "1.37.0", features = ["full"] }
-
-# 🛠️ Serialization & Data Processing
 serde = { version = "1.0.202", features = ["derive"] }
-serde_json = "1.0.117"
 
-# 🚀 Performance Optimization
-rayon = "1.8.1"
-tokio-console = "0.1.13"
-flamegraph = "0.2.0"
-
-# 🔧 Misc Utilities
-log = "0.4.21"
-env_logger = "0.10.2"
-dotenv = "0.15.0"
-
-# -------------------------------
-# 📌 Dependency Overrides (Remove if not needed)
-# -------------------------------
-# Removed empty patch section - zeroize pinning in dependencies is sufficient
-
-# -------------------------------
-# 📌 Development Dependencies
-# -------------------------------
-[dev-dependencies]
-criterion = { version = "0.5.1", features = ["html_reports"] }
-
-[[bench]]
-name = "performance_tests"
-harness = false
-path = "benches/performance_tests.rs"
+[patch.crates-io]
+curve25519-dalek = { git = "https://github.com/dalek-cryptography/curve25519-dalek", rev = "a1d4f20" }
