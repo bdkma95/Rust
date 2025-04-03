@@ -374,9 +374,9 @@ pub struct Vote<'info> {
     pub vote_marker: Account<'info, VoteMarker>,
     
     #[account(
-        constraint = voter_token.mint == governance.token_mint,
-        constraint = voter_token.owner == *voter.key
-    )]
+    constraint = voter_token.mint == governance.token_mint 
+        @ VoteError::InvalidToken
+)]
     pub voter_token: Account<'info, TokenAccount>,
     
     #[account(mut)]
@@ -405,6 +405,7 @@ pub struct CloseVote<'info> {
         ],
         bump = vote_marker.bump
     )]
+    #[account(close = voter)] // Anchor handles rent automatically
     pub vote_marker: Account<'info, VoteMarker>,
     #[account(mut)]
     pub voter: Signer<'info>,
