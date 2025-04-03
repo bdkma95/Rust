@@ -27,6 +27,9 @@ pub enum VoteError {
     MaxProposalsExceeded,
     #[msg("Vote count overflow")]
     Overflow,
+    #[error_code]
+    #[msg("Voter has been slashed")]
+    VoterSlashed,
 }
 
 #[event]
@@ -44,6 +47,12 @@ pub struct VoteCast {
     pub timestamp: i64,
 }
 
+#[event]
+pub struct VoteClosed {
+    pub proposal_id: u64,
+    pub closed_by: Pubkey,
+}
+
 #[account]
 pub struct Proposal {
     pub id: u64,
@@ -57,10 +66,9 @@ pub struct Proposal {
 
 #[account]
 pub struct ProposalCounter {
-    pub count: u64,
-    pub max_proposals: u64,
-    pub admin: Pubkey,
-    pub token_mint: Pubkey,
+    pub min_voting_duration: i64,
+    pub max_voting_duration: i64,
+    pub min_token_balance: u64,
 }
 
 #[account]
@@ -68,6 +76,12 @@ pub struct VoteMarker {
     pub proposal_id: u64,
     pub voter: Pubkey,
     pub voted_at: i64,
+}
+
+#[account]
+pub struct VoterReputation {
+    pub strikes: u8,
+    pub last_vote: i64,
 }
 
 #[program]
@@ -114,7 +128,9 @@ mod voting_system {
         proposal.voting_end = proposal.voting_start + duration;
         proposal.bump = ctx.bumps.proposal;
 
-        counter.count = counter.count.checked_add(1).unwrap();
+        counter.count = counter.count
+            .checked_add(1)
+            .ok_or(VoteError::MaxProposalsExceeded)?;
 
         emit!(ProposalCreated {
             id: proposal.id,
@@ -170,6 +186,10 @@ mod voting_system {
             Clock::get()?.unix_timestamp > ctx.accounts.proposal.voting_end,
             VoteError::VotingInactive
         );
+        emit!(VoteClosed {
+        proposal_id: vote_marker.proposal_id,
+        closed_by: *ctx.accounts.voter.key
+    });
 
         Ok(())
     }
@@ -213,11 +233,15 @@ pub struct CreateProposal<'info> {
 
 #[derive(Accounts)]
 pub struct Vote<'info> {
+    // Add nonce to seeds
     #[account(
-        mut,
-        seeds = [b"proposal", proposal.id.to_le_bytes().as_ref()],
-        bump = proposal.bump
-    )]
+        init,
+        seeds = [
+            b"vote", 
+            proposal.key().as_ref(),
+            voter.key().as_ref(),
+            &nonce.to_le_bytes()
+        ],
     pub proposal: Account<'info, Proposal>,
     
     #[account(
@@ -232,6 +256,10 @@ pub struct Vote<'info> {
         space = VoteMarker::LEN
     )]
     pub vote_marker: Account<'info, VoteMarker>,
+
+    // Add nonce account
+    #[account()]
+    pub nonce: AccountInfo<'info>,
     
     #[account(
         constraint = voter_token.mint == proposal_counter.token_mint,
