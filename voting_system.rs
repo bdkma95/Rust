@@ -148,9 +148,6 @@ pub mod voting_system {
         let voter = &ctx.accounts.voter;
         let rent = Rent::get()?;
         let lamports = rent.minimum_balance(vote_account.to_account_info().data_len());
-        
-        **vote_account.to_account_info().try_borrow_mut_lamports()? -= lamports;
-        **voter.to_account_info().try_borrow_mut_lamports()? += lamports;
 
         vote_account.close(voter.to_account_info())?;
 
@@ -405,7 +402,6 @@ pub struct CloseVote<'info> {
         ],
         bump = vote_marker.bump
     )]
-    #[account(close = voter)] // Anchor handles rent automatically
     pub vote_marker: Account<'info, VoteMarker>,
     #[account(mut)]
     pub voter: Signer<'info>,
