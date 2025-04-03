@@ -1,37 +1,219 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::sysvar::Sysvar;
 use anchor_spl::token::{Token, TokenAccount};
-use solana_program::clock::Clock;
+use solana_program::{clock::Clock, rent::Rent, system_program};
 
-// Configuration constants
-const MAX_TITLE_LEN: usize = 100;
-const MAX_DESC_LEN: usize = 500;
-const MIN_VOTING_DURATION: i64 = 3600; // 1 hour
-const MAX_VOTING_DURATION: i64 = 2592000; // 30 days
-const MIN_TOKEN_BALANCE: u64 = 1000000; // 1 token (6 decimals)
+// Anchor v0.24.2 recommended for production
+#[program]
+pub mod voting_system {
+    use super::*;
 
-#[error_code]
-pub enum VoteError {
-    #[msg("Unauthorized access")]
-    Unauthorized,
-    #[msg("Voting period not active")]
-    VotingInactive,
-    #[msg("Insufficient token balance")]
-    InsufficientTokens,
-    #[msg("Title exceeds maximum length")]
-    TitleTooLong,
-    #[msg("Description exceeds maximum length")]
-    DescriptionTooLong,
-    #[msg("Invalid voting duration")]
-    InvalidDuration,
-    #[msg("Max proposals exceeded")]
-    MaxProposalsExceeded,
-    #[msg("Vote count overflow")]
-    Overflow,
-    #[error_code]
-    #[msg("Voter has been slashed")]
-    VoterSlashed,
+    /// Initialize governance system with safe defaults
+    pub fn initialize(
+        ctx: Context<Initialize>,
+        config: GovernanceConfig,
+    ) -> Result<()> {
+        let counter = &mut ctx.accounts.governance;
+        
+        // Validate initial parameters
+        require!(
+            config.max_voting_duration > config.min_voting_duration,
+            VoteError::InvalidConfig
+        );
+        require!(
+            config.min_token_balance > 0,
+            VoteError::InvalidConfig
+        );
+
+        counter.admin = *ctx.accounts.admin.key;
+        counter.version = 1;
+        counter.paused = false;
+        counter.config = config;
+        counter.token_mint = ctx.accounts.token_mint.key();
+        Ok(())
+    }
+
+    /// Create proposal with versioned configuration
+    pub fn create_proposal(
+        ctx: Context<CreateProposal>,
+        title: String,
+        description: String,
+        duration: i64,
+    ) -> Result<()> {
+        let governance = &ctx.accounts.governance;
+        
+        // System pause check
+        require!(!governance.paused, VoteError::SystemPaused);
+        
+        // Input validation
+        require!(
+            title.len() <= governance.config.max_title_length,
+            VoteError::TitleTooLong
+        );
+        require!(
+            description.len() <= governance.config.max_description_length,
+            VoteError::DescriptionTooLong
+        );
+        require!(
+            duration >= governance.config.min_voting_duration &&
+            duration <= governance.config.max_voting_duration,
+            VoteError::InvalidDuration
+        );
+
+        // Proposal lifecycle management
+        let clock = Clock::get()?;
+        let proposal = &mut ctx.accounts.proposal;
+        proposal.initialize(
+            governance.proposal_count,
+            title,
+            description,
+            clock.unix_timestamp,
+            duration,
+            *ctx.bumps.get("proposal").ok_or(VoteError::InvalidBump)?,
+        )?;
+
+        // Safe counter increment
+        governance.proposal_count = governance.proposal_count
+            .checked_add(1)
+            .ok_or(VoteError::MaxProposalsExceeded)?;
+
+        emit!(ProposalCreated {
+            id: proposal.id,
+            title: proposal.title.clone(),
+            start: proposal.voting_start,
+            end: proposal.voting_end
+        });
+
+        Ok(())
+    }
+
+    /// Secure voting with anti-replay protection
+    pub fn vote(ctx: Context<Vote>) -> Result<()> {
+        let governance = &ctx.accounts.governance;
+        require!(!governance.paused, VoteError::SystemPaused);
+        
+        let clock = Clock::get()?;
+        let proposal = &mut ctx.accounts.proposal;
+        let voter = &ctx.accounts.voter;
+        
+        // Voting period validation
+        require!(
+            clock.unix_timestamp >= proposal.voting_start &&
+            clock.unix_timestamp <= proposal.voting_end,
+            VoteError::VotingInactive
+        );
+
+        // Token-based eligibility check
+        let token_account = &ctx.accounts.voter_token;
+        require!(
+            token_account.amount >= governance.config.min_token_balance,
+            VoteError::InsufficientTokens
+        );
+
+        // Record vote with nonce protection
+        let vote_marker = &mut ctx.accounts.vote_marker;
+        vote_marker.register(
+            proposal.id,
+            *voter.key,
+            clock.unix_timestamp,
+            *ctx.bumps.get("vote_marker").ok_or(VoteError::InvalidBump)?
+        )?;
+
+        // Update proposal state
+        proposal.vote_count = proposal.vote_count
+            .checked_add(1)
+            .ok_or(VoteError::Overflow)?;
+
+        emit!(VoteCast {
+            proposal_id: proposal.id,
+            voter: *voter.key,
+            timestamp: clock.unix_timestamp
+        });
+
+        Ok(())
+    }
+
+    /// Safe vote account closure with rent reclamation
+    pub fn close_vote(ctx: Context<CloseVote>) -> Result<()> {
+        let clock = Clock::get()?;
+        let proposal = &ctx.accounts.proposal;
+        require!(
+            clock.unix_timestamp > proposal.voting_end,
+            VoteError::VotingInactive
+        );
+
+        // Calculate and transfer rent
+        let vote_account = &ctx.accounts.vote_marker;
+        let voter = &ctx.accounts.voter;
+        let rent = Rent::get()?;
+        let lamports = rent.minimum_balance(vote_account.to_account_info().data_len());
+        
+        **vote_account.to_account_info().try_borrow_mut_lamports()? -= lamports;
+        **voter.to_account_info().try_borrow_mut_lamports()? += lamports;
+
+        vote_account.close(voter.to_account_info())?;
+
+        emit!(VoteClosed {
+            proposal_id: proposal.id,
+            closed_by: *voter.key
+        });
+
+        Ok(())
+    }
+
+    /// Emergency pause/unpause
+    pub fn set_paused(ctx: Context<PauseOperations>, paused: bool) -> Result<()> {
+        ctx.accounts.governance.paused = paused;
+        emit!(SystemPaused {
+            admin: *ctx.accounts.admin.key,
+            timestamp: Clock::get()?.unix_timestamp,
+            paused
+        });
+        Ok(())
+    }
 }
 
+// Core data structures
+#[account]
+pub struct Governance {
+    pub admin: Pubkey,
+    pub version: u8,
+    pub paused: bool,
+    pub proposal_count: u64,
+    pub token_mint: Pubkey,
+    pub config: GovernanceConfig,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct GovernanceConfig {
+    pub max_title_length: usize,
+    pub max_description_length: usize,
+    pub min_voting_duration: i64,
+    pub max_voting_duration: i64,
+    pub min_token_balance: u64,
+    pub max_proposals: u64,
+}
+
+#[account]
+pub struct Proposal {
+    pub id: u64,
+    pub title: String,
+    pub description: String,
+    pub vote_count: u64,
+    pub voting_start: i64,
+    pub voting_end: i64,
+    pub bump: u8,
+}
+
+#[account]
+pub struct VoteMarker {
+    pub proposal_id: u64,
+    pub voter: Pubkey,
+    pub voted_at: i64,
+    pub bump: u8,
+}
+
+// Event logging
 #[event]
 pub struct ProposalCreated {
     pub id: u64,
@@ -53,172 +235,109 @@ pub struct VoteClosed {
     pub closed_by: Pubkey,
 }
 
-#[account]
-pub struct Proposal {
-    pub id: u64,
-    pub title: String,
-    pub description: String,
-    pub vote_count: u64,
-    pub voting_start: i64,
-    pub voting_end: i64,
-    pub bump: u8,
+#[event]
+pub struct SystemPaused {
+    pub admin: Pubkey,
+    pub timestamp: i64,
+    pub paused: bool,
 }
 
-#[account]
-pub struct ProposalCounter {
-    pub min_voting_duration: i64,
-    pub max_voting_duration: i64,
-    pub min_token_balance: u64,
+// Error handling
+#[error_code]
+pub enum VoteError {
+    #[msg("System paused")]
+    SystemPaused,
+    #[msg("Unauthorized access")]
+    Unauthorized,
+    #[msg("Invalid configuration")]
+    InvalidConfig,
+    #[msg("Invalid bump seed")]
+    InvalidBump,
+    #[msg("Voting period not active")]
+    VotingInactive,
+    #[msg("Insufficient token balance")]
+    InsufficientTokens,
+    #[msg("Title exceeds maximum length")]
+    TitleTooLong,
+    #[msg("Description exceeds maximum length")]
+    DescriptionTooLong,
+    #[msg("Invalid voting duration")]
+    InvalidDuration,
+    #[msg("Maximum proposals exceeded")]
+    MaxProposalsExceeded,
+    #[msg("Vote count overflow")]
+    Overflow,
 }
 
-#[account]
-pub struct VoteMarker {
-    pub proposal_id: u64,
-    pub voter: Pubkey,
-    pub voted_at: i64,
-}
-
-#[account]
-pub struct VoterReputation {
-    pub strikes: u8,
-    pub last_vote: i64,
-}
-
-#[program]
-mod voting_system {
-    use super::*;
-
-    /// Initialize governance system
+// Implementation blocks
+impl Proposal {
     pub fn initialize(
-        ctx: Context<Initialize>,
-        max_proposals: u64,
-        token_mint: Pubkey,
-    ) -> Result<()> {
-        let counter = &mut ctx.accounts.proposal_counter;
-        counter.admin = *ctx.accounts.admin.key;
-        counter.max_proposals = max_proposals;
-        counter.token_mint = token_mint;
-        Ok(())
-    }
-
-    /// Create new proposal with time constraints
-    pub fn create_proposal(
-        ctx: Context<CreateProposal>,
+        &mut self,
+        id: u64,
         title: String,
         description: String,
+        start: i64,
         duration: i64,
+        bump: u8,
     ) -> Result<()> {
-        // Validate inputs
-        require!(title.len() <= MAX_TITLE_LEN, VoteError::TitleTooLong);
-        require!(description.len() <= MAX_DESC_LEN, VoteError::DescriptionTooLong);
-        require!(
-            duration >= MIN_VOTING_DURATION && duration <= MAX_VOTING_DURATION,
-            VoteError::InvalidDuration
-        );
-
-        let clock = Clock::get()?;
-        let counter = &mut ctx.accounts.proposal_counter;
-        require!(counter.count < counter.max_proposals, VoteError::MaxProposalsExceeded);
-
-        let proposal = &mut ctx.accounts.proposal;
-        proposal.id = counter.count;
-        proposal.title = title.clone();
-        proposal.description = description;
-        proposal.voting_start = clock.unix_timestamp;
-        proposal.voting_end = proposal.voting_start + duration;
-        proposal.bump = ctx.bumps.proposal;
-
-        counter.count = counter.count
-            .checked_add(1)
-            .ok_or(VoteError::MaxProposalsExceeded)?;
-
-        emit!(ProposalCreated {
-            id: proposal.id,
-            title,
-            start: proposal.voting_start,
-            end: proposal.voting_end
-        });
-
-        Ok(())
-    }
-
-    /// Cast vote with token checks
-    pub fn vote(ctx: Context<Vote>) -> Result<()> {
-        let clock = Clock::get()?;
-        let proposal = &mut ctx.accounts.proposal;
-        
-        // Validate voting period
-        require!(
-            clock.unix_timestamp >= proposal.voting_start &&
-            clock.unix_timestamp <= proposal.voting_end,
-            VoteError::VotingInactive
-        );
-
-        // Check token balance
-        require!(
-            ctx.accounts.voter_token.amount >= MIN_TOKEN_BALANCE,
-            VoteError::InsufficientTokens
-        );
-
-        // Record vote
-        let vote_marker = &mut ctx.accounts.vote_marker;
-        vote_marker.proposal_id = proposal.id;
-        vote_marker.voter = *ctx.accounts.voter.key;
-        vote_marker.voted_at = clock.unix_timestamp;
-
-        proposal.vote_count = proposal.vote_count
-            .checked_add(1)
-            .ok_or(VoteError::Overflow)?;
-
-        emit!(VoteCast {
-            proposal_id: proposal.id,
-            voter: *ctx.accounts.voter.key,
-            timestamp: clock.unix_timestamp
-        });
-
-        Ok(())
-    }
-
-    /// Close vote account and reclaim rent
-    pub fn close_vote(ctx: Context<CloseVote>) -> Result<()> {
-        let vote_marker = ctx.accounts.vote_marker;
-        require!(
-            Clock::get()?.unix_timestamp > ctx.accounts.proposal.voting_end,
-            VoteError::VotingInactive
-        );
-        emit!(VoteClosed {
-        proposal_id: vote_marker.proposal_id,
-        closed_by: *ctx.accounts.voter.key
-    });
-
+        self.id = id;
+        self.title = title;
+        self.description = description;
+        self.vote_count = 0;
+        self.voting_start = start;
+        self.voting_end = start.checked_add(duration)
+            .ok_or(VoteError::InvalidDuration)?;
+        self.bump = bump;
         Ok(())
     }
 }
 
-// Account validation structures
+impl VoteMarker {
+    pub fn register(
+        &mut self,
+        proposal_id: u64,
+        voter: Pubkey,
+        timestamp: i64,
+        bump: u8,
+    ) -> Result<()> {
+        self.proposal_id = proposal_id;
+        self.voter = voter;
+        self.voted_at = timestamp;
+        self.bump = bump;
+        Ok(())
+    }
+}
 
+// Account validation
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = admin, space = 8 + ProposalCounter::LEN)]
-    pub proposal_counter: Account<'info, ProposalCounter>,
+    #[account(
+        init, 
+        payer = admin, 
+        space = 8 + Governance::LEN,
+        seeds = [b"governance"],
+        bump
+    )]
+    pub governance: Account<'info, Governance>,
     #[account(mut)]
     pub admin: Signer<'info>,
+    pub token_mint: Account<'info, TokenAccount>,
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 pub struct CreateProposal<'info> {
     #[account(
-        mut, 
-        seeds = [b"proposal_counter"], 
+        mut,
+        seeds = [b"governance"],
         bump,
         has_one = admin
     )]
-    pub proposal_counter: Account<'info, ProposalCounter>,
+    pub governance: Account<'info, Governance>,
     
     #[account(
         init,
-        seeds = [b"proposal", proposal_counter.count.to_le_bytes().as_ref()],
+        seeds = [b"proposal", governance.proposal_count.to_le_bytes().as_ref()],
         bump,
         payer = payer,
         space = Proposal::LEN
@@ -233,15 +352,11 @@ pub struct CreateProposal<'info> {
 
 #[derive(Accounts)]
 pub struct Vote<'info> {
-    // Add nonce to seeds
     #[account(
-        init,
-        seeds = [
-            b"vote", 
-            proposal.key().as_ref(),
-            voter.key().as_ref(),
-            &nonce.to_le_bytes()
-        ],
+        mut,
+        seeds = [b"proposal", proposal.id.to_le_bytes().as_ref()],
+        bump = proposal.bump
+    )]
     pub proposal: Account<'info, Proposal>,
     
     #[account(
@@ -249,29 +364,31 @@ pub struct Vote<'info> {
         seeds = [
             b"vote", 
             proposal.key().as_ref(), 
-            voter.key().as_ref()
+            voter.key().as_ref(),
+            &proposal.vote_count.to_le_bytes()
         ],
         bump,
         payer = voter,
         space = VoteMarker::LEN
     )]
     pub vote_marker: Account<'info, VoteMarker>,
-
-    // Add nonce account
-    #[account()]
-    pub nonce: AccountInfo<'info>,
     
     #[account(
-        constraint = voter_token.mint == proposal_counter.token_mint,
+        constraint = voter_token.mint == governance.token_mint,
         constraint = voter_token.owner == *voter.key
     )]
     pub voter_token: Account<'info, TokenAccount>,
     
     #[account(mut)]
     pub voter: Signer<'info>,
-    #[account(mut)]
-    pub proposal_counter: Account<'info, ProposalCounter>,
+    #[account(
+        mut,
+        seeds = [b"governance"],
+        bump
+    )]
+    pub governance: Account<'info, Governance>,
     pub token_program: Program<'info, Token>,
+    pub clock: Sysvar<'info, Clock>,
 }
 
 #[derive(Accounts)]
@@ -279,29 +396,47 @@ pub struct CloseVote<'info> {
     #[account(
         mut,
         close = voter,
+        has_one = voter,
         seeds = [
             b"vote", 
             proposal.key().as_ref(), 
-            voter.key().as_ref()
+            voter.key().as_ref(),
+            &vote_marker.voted_at.to_le_bytes()
         ],
-        bump
+        bump = vote_marker.bump
     )]
     pub vote_marker: Account<'info, VoteMarker>,
     #[account(mut)]
     pub voter: Signer<'info>,
     pub proposal: Account<'info, Proposal>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct PauseOperations<'info> {
+    #[account(
+        mut,
+        seeds = [b"governance"],
+        bump,
+        has_one = admin
+    )]
+    pub governance: Account<'info, Governance>,
+    pub admin: Signer<'info>,
 }
 
 // Space calculations
-
-impl Proposal {
-    const LEN: usize = 8 + 8 + (4 + MAX_TITLE_LEN) + (4 + MAX_DESC_LEN) + 8 + 8 + 8 + 1;
+impl Governance {
+    const LEN: usize = 32 + 1 + 1 + 8 + 32 + GovernanceConfig::LEN;
 }
 
-impl ProposalCounter {
-    const LEN: usize = 8 + 8 + 8 + 32 + 32;
+impl GovernanceConfig {
+    const LEN: usize = 8 + 8 + 8 + 8 + 8 + 8;
+}
+
+impl Proposal {
+    const LEN: usize = 8 + 8 + (4 + 256) + (4 + 1024) + 8 + 8 + 8 + 1;
 }
 
 impl VoteMarker {
-    const LEN: usize = 8 + 8 + 32 + 8;
+    const LEN: usize = 8 + 8 + 32 + 8 + 1;
 }
