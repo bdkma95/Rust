@@ -1,21 +1,18 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::sysvar::Sysvar;
-use anchor_spl::token::{Token, TokenAccount};
+use anchor_spl::token::{Mint, Token, TokenAccount};
 use solana_program::{clock::Clock, rent::Rent, system_program};
 
-// Anchor v0.24.2 recommended for production
 #[program]
 pub mod voting_system {
     use super::*;
 
-    /// Initialize governance system with safe defaults
     pub fn initialize(
         ctx: Context<Initialize>,
         config: GovernanceConfig,
     ) -> Result<()> {
         let counter = &mut ctx.accounts.governance;
         
-        // Validate initial parameters
         require!(
             config.max_voting_duration > config.min_voting_duration,
             VoteError::InvalidConfig
@@ -23,6 +20,10 @@ pub mod voting_system {
         require!(
             config.min_token_balance > 0,
             VoteError::InvalidConfig
+        );
+        require!(
+            ctx.accounts.token_mint.decimals == config.token_decimals,
+            VoteError::InvalidTokenDecimals
         );
 
         counter.admin = *ctx.accounts.admin.key;
@@ -192,6 +193,7 @@ pub struct GovernanceConfig {
     pub max_voting_duration: i64,
     pub min_token_balance: u64,
     pub max_proposals: u64,
+    pub token_decimals: u8, // Added decimal validation
 }
 
 #[account]
@@ -251,6 +253,10 @@ pub enum VoteError {
     Unauthorized,
     #[msg("Invalid configuration")]
     InvalidConfig,
+    #[msg("Invalid token decimals")]
+    InvalidTokenDecimals,
+    #[msg("Invalid governance token")]
+    InvalidToken,
     #[msg("Invalid bump seed")]
     InvalidBump,
     #[msg("Voting period not active")]
@@ -311,17 +317,11 @@ impl VoteMarker {
 // Account validation
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(
-        init, 
-        payer = admin, 
-        space = 8 + Governance::LEN,
-        seeds = [b"governance"],
-        bump
-    )]
+    #[account(init, payer = admin, space = 8 + Governance::LEN, seeds = [b"governance"], bump)]
     pub governance: Account<'info, Governance>,
     #[account(mut)]
     pub admin: Signer<'info>,
-    pub token_mint: Account<'info, TokenAccount>,
+    pub token_mint: Account<'info, Mint>, // Correct mint type
     pub system_program: Program<'info, System>,
 }
 
