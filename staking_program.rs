@@ -180,6 +180,10 @@ pub mod enterprise_staking {
                 .unwrap_or_default(),
             unlock_time,
         });
+        require!(
+    config.pending_proposals.len() < MAX_PENDING_PROPOSALS,
+    ErrorCode::ProposalCapacityExceeded
+);
 
         Ok(())
     }
@@ -259,6 +263,10 @@ impl StakingConfig {
     pub fn schedule_reward(&mut self, start_time: i64, rate: u64, duration: i64) -> Result<()> {
         validate_reward_schedule(start_time, rate, duration)?;
         self.reward_schedules.push(RewardSchedule { start_time, rate, duration });
+        require!(
+    self.reward_schedules.len() < MAX_REWARD_SCHEDULES,
+    ErrorCode::MaxSchedulesExceeded
+);
         Ok(())
     }
 
