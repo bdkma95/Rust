@@ -11,6 +11,7 @@ const MAX_ADMINS: usize = 10;
 const MAX_PENDING_PROPOSALS: usize = 5;
 const MAX_REWARD_SCHEDULES: usize = 12;
 const MAX_REWARD_RATE: u64 = 1_000_000; // Adjust based on token decimals
+const MAX_USER_DEPOSITS: usize = 100;
 
 #[program]
 pub mod enterprise_staking {
@@ -143,6 +144,10 @@ pub mod enterprise_staking {
     pub fn claim_rewards(ctx: Context<ClaimRewards>) -> Result<()> {
         let config = &mut ctx.accounts.config;
         let user_stake = &mut ctx.accounts.user_stake;
+        require!(
+            ctx.accounts.rewards_vault.amount >= rewards,
+            ErrorCode::InsufficientRewards
+        )
         
         validate_claim(config, user_stake)?;
         update_rewards(config)?;
@@ -163,10 +168,6 @@ pub mod enterprise_staking {
             amount: rewards,
             timestamp: Clock::get()?.unix_timestamp
         });
-        require!(
-        ctx.accounts.rewards_vault.amount >= rewards,
-        ErrorCode::InsufficientRewards
-    )
 
         Ok(())
     }
@@ -199,6 +200,9 @@ pub mod enterprise_staking {
     }
 
     pub fn execute_proposal(ctx: Context<ExecuteProposal>, proposal_id: u64) -> Result<()> {
+        // Add reentrancy protection
+        require!(!ctx.accounts.config.in_operation, ErrorCode::ReentrancyGuard);
+        ctx.accounts.config.in_operation = true;
         let config = &mut ctx.accounts.config;
         verify_multisig(ctx.remaining_accounts, config)?;
 
@@ -217,7 +221,7 @@ pub mod enterprise_staking {
 
         proposal.mark_executed();
         emit!(AdminProposalExecuted { proposal_id, proposal_type: proposal.proposal.proposal_type() });
-
+        ctx.accounts.config.in_operation = false;
         Ok(())
     }
 
@@ -283,6 +287,16 @@ impl StakingConfig {
     // Additional methods...
 }
 
+// Add vault ownership verification
+#[derive(Accounts)]
+pub struct ClaimRewards<'info> {
+    #[account(
+        constraint = rewards_vault.owner == config.key(),
+        constraint = rewards_vault.mint == config.reward_token_mint
+    )]
+    pub rewards_vault: Account<'info, TokenAccount>,
+}
+
 #[account]
 pub struct UserStake {
     pub user: Pubkey,
@@ -294,7 +308,11 @@ pub struct UserStake {
 }
 
 impl UserStake {
-    pub fn update(&mut self, amount: u64, reward_per_token: u128) -> Result<()> {
+    pub fn update(&mut self, amount: u64) -> Result<()> {
+        require!(
+            self.amounts.len() < MAX_USER_DEPOSITS,
+            ErrorCode::MaxDepositsExceeded
+        );
         self.amounts.push(amount);
         self.deposit_times.push(Clock::get()?.unix_timestamp);
         self.reward_per_token_complete = reward_per_token;
@@ -342,11 +360,10 @@ fn validate_reward_schedule(start_time: i64, rate: u64, duration: i64) -> Result
 
 fn validate_proposal(proposal: &Proposal) -> Result<()> {
     match proposal {
-        Proposal::ScheduleReward { start_time, rate, duration } => 
-            validate_reward_schedule(*start_time, *rate, *duration),
-        Proposal::UpdateRewardRate(rate) => 
+        Proposal::UpdateRewardRate(rate) => {
             require!(*rate > 0, ErrorCode::InvalidRewardRate);
             require!(*rate <= MAX_REWARD_RATE, ErrorCode::RateLimitExceeded);
+        }  // Missing closing bracket
         _ => Ok(())
     }
 }
@@ -405,4 +422,10 @@ pub enum ErrorCode {
     RateLimitExceeded,
     #[msg("Insufficient rewards in vault")]
     InsufficientRewards,
+    #[msg("Maximum deposits per user exceeded")]
+    MaxDepositsExceeded,
+    #[msg("Reentrancy protection triggered")]
+    ReentrancyGuard,
+    #[msg("Invalid vault ownership")]
+    InvalidVaultOwnership,
 }
