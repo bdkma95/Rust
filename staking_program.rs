@@ -40,36 +40,183 @@ pub mod staking_program {
         timestamp: i64,
     }
 
+    #[event]
+    pub struct AdminProposalCreated {
+        proposal_id: u64,
+        proposal_type: String,
+        unlock_time: i64,
+    }
+
+    #[event]
+    pub struct AdminProposalExecuted {
+        proposal_id: u64,
+        proposal_type: String,
+    }
+
+    #[event]
+    pub struct RewardScheduleUpdated {
+        start_time: i64,
+        rate: u64,
+        duration: i64,
+    }
+
+    // Initialize program with multi-sig setup
     pub fn initialize(
         ctx: Context<Initialize>,
-        lockup_period: i64,
-        reward_rate: u64,
-        reward_duration: i64,
+        params: InitializeParams,
     ) -> Result<()> {
         let config = &mut ctx.accounts.config;
         
-        require!(ctx.accounts.admin.is_signer, ErrorCode::Unauthorized);
-        require!(lockup_period > 0, ErrorCode::InvalidParameter);
-        require!(reward_rate > 0, ErrorCode::InvalidParameter);
-        require!(reward_duration > 0, ErrorCode::InvalidParameter);
+        // Validate inputs
+        require!(params.admins.len() >= params.threshold as usize, ErrorCode::InvalidParameter);
+        require!(params.threshold > 0, ErrorCode::InvalidParameter);
+        require!(params.proposal_delay > 0, ErrorCode::InvalidParameter);
+        require!(params.reward_rate > 0, ErrorCode::InvalidParameter);
+        require!(params.reward_duration > 0, ErrorCode::InvalidParameter);
 
-        config.admin = ctx.accounts.admin.key();
+        // Initialize config
+        config.admins = params.admins;
+        config.threshold = params.threshold;
+        config.proposal_delay = params.proposal_delay;
+        config.reward_rate = params.reward_rate;
+        config.reward_duration_end = Clock::get()?.unix_timestamp + params.reward_duration;
         config.staking_token_mint = ctx.accounts.staking_token_mint.key();
         config.reward_token_mint = ctx.accounts.reward_token_mint.key();
-        config.lockup_period = lockup_period;
-        config.reward_rate = reward_rate;
-        config.staking_vault = ctx.accounts.staking_vault.key();
-        config.rewards_vault = ctx.accounts.rewards_vault.key();
-        config.bump = ctx.bumps.config;
-        config.total_staked = 0;
-        config.reward_per_token_stored = 0;
-        config.last_update_time = Clock::get()?.unix_timestamp;
-        config.reward_duration_end = Clock::get()?.unix_timestamp + reward_duration;
-        config.emergency_mode = false;
+        config.upgrade_authority = params.upgrade_authority;
+        config.emergency_vault = ctx.accounts.emergency_vault.key();
 
         Ok(())
     }
 
+    // Time-locked admin proposals
+    pub fn create_proposal(
+        ctx: Context<CreateProposal>,
+        proposal: Proposal,
+    ) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        verify_multisig(ctx.remaining_accounts, config)?;
+
+        require!(config.pending_proposals.len() < MAX_PENDING_PROPOSALS, ErrorCode::ProposalLimit);
+        
+        let proposal_id = config.proposal_counter;
+        config.proposal_counter += 1;
+        
+        let pending_proposal = PendingProposal {
+            id: proposal_id,
+            proposal,
+            unlock_time: Clock::get()?.unix_timestamp + config.proposal_delay,
+            executed: false,
+        };
+        
+        config.pending_proposals.push(pending_proposal);
+        
+        emit!(AdminProposalCreated {
+            proposal_id,
+            proposal_type: proposal.proposal_type(),
+            unlock_time: pending_proposal.unlock_time,
+        });
+        
+        Ok(())
+    }
+
+    pub fn execute_proposal(
+        ctx: Context<ExecuteProposal>,
+        proposal_id: u64,
+    ) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        verify_multisig(ctx.remaining_accounts, config)?;
+
+        let proposal = config.pending_proposals.iter_mut()
+            .find(|p| p.id == proposal_id)
+            .ok_or(ErrorCode::ProposalNotFound)?;
+            
+        require!(!proposal.executed, ErrorCode::ProposalAlreadyExecuted);
+        require!(Clock::get()?.unix_timestamp >= proposal.unlock_time, ErrorCode::ProposalLocked);
+        
+        match &proposal.proposal {
+            Proposal::UpdateRewardRate(rate) => {
+                config.next_reward_rate = Some(*rate);
+            }
+            Proposal::UpdateAdmins { new_admins, new_threshold } => {
+                config.admins = new_admins.clone();
+                config.threshold = *new_threshold;
+            }
+            Proposal::ScheduleReward { start_time, rate, duration } => {
+                config.reward_schedules.push(RewardSchedule {
+                    start_time: *start_time,
+                    rate: *rate,
+                    duration: *duration,
+                });
+            }
+            Proposal::SetUpgradeAuthority(authority) => {
+                config.upgrade_authority = *authority;
+            }
+        }
+        
+        proposal.executed = true;
+        
+        emit!(AdminProposalExecuted {
+            proposal_id,
+            proposal_type: proposal.proposal.proposal_type(),
+        });
+        
+        Ok(())
+    }
+
+    // Reward distribution scheduling
+    fn update_rewards(config: &mut Account<StakingConfig>) -> Result<()> {
+        let current_time = Clock::get()?.unix_timestamp;
+        
+        // Check scheduled rewards
+        while let Some(schedule) = config.reward_schedules.first() {
+            if current_time >= schedule.start_time {
+                config.reward_rate = schedule.rate;
+                config.reward_duration_end = schedule.start_time + schedule.duration;
+                config.reward_schedules.remove(0);
+                
+                emit!(RewardScheduleUpdated {
+                    start_time: schedule.start_time,
+                    rate: schedule.rate,
+                    duration: schedule.duration,
+                });
+            } else {
+                break;
+            }
+        }
+    
+    // Program upgrade authority management
+    pub fn set_upgrade_authority(
+        ctx: Context<SetUpgradeAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        verify_multisig(ctx.remaining_accounts, config)?;
+        
+        config.upgrade_authority = new_authority;
+        Ok(())
+    }
+
+    // Multi-sig verification helper
+    fn verify_multisig(
+        remaining_accounts: &[AccountInfo],
+        config: &StakingConfig,
+    ) -> Result<()> {
+        let mut signer_count = 0;
+        let mut seen = std::collections::HashSet::new();
+        
+        for account in remaining_accounts {
+            if account.is_signer && config.admins.contains(account.key) {
+                if seen.insert(*account.key) {
+                    signer_count += 1;
+                }
+            }
+        }
+        
+        require!(signer_count >= config.threshold as usize, ErrorCode::Unauthorized);
+        Ok(())
+    }
+}
+    
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         require!(!ctx.accounts.config.emergency_mode, ErrorCode::EmergencyMode);
         require!(amount > 0, ErrorCode::InvalidAmount);
@@ -390,23 +537,60 @@ pub struct SetEmergencyMode<'info> {
     pub config: Account<'info, StakingConfig>,
 }
 
-// Remaining structs and error codes...
+// Account validation structs
+#[derive(Accounts)]
+pub struct CreateProposal<'info> {
+    #[account(mut, seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, StakingConfig>,
+    // ... other accounts ...
+}
+
+#[derive(Accounts)]
+pub struct ExecuteProposal<'info> {
+    #[account(mut, seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, StakingConfig>,
+    // ... other accounts ...
+}
+
+// Data Structures
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub enum Proposal {
+    UpdateRewardRate(u64),
+    UpdateAdmins { new_admins: Vec<Pubkey>, new_threshold: u8 },
+    ScheduleReward { start_time: i64, rate: u64, duration: i64 },
+    SetUpgradeAuthority(Pubkey),
+}
 
 #[account]
 pub struct StakingConfig {
-    pub admin: Pubkey,
-    pub staking_token_mint: Pubkey,
-    pub reward_token_mint: Pubkey,
-    pub lockup_period: i64,
+    // Multi-sig parameters
+    pub admins: Vec<Pubkey>,
+    pub threshold: u8,
+    pub proposal_delay: i64,
+    pub pending_proposals: Vec<PendingProposal>,
+    pub proposal_counter: u64,
+    
+    // Reward scheduling
     pub reward_rate: u64,
-    pub staking_vault: Pubkey,
-    pub rewards_vault: Pubkey,
-    pub bump: u8,
-    pub total_staked: u64,
-    pub reward_per_token_stored: u128,
-    pub last_update_time: i64,
+    pub reward_schedules: Vec<RewardSchedule>,
     pub reward_duration_end: i64,
-    pub emergency_mode: bool,
+    
+    // Program upgrade
+    pub upgrade_authority: Pubkey,
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct PendingProposal {
+    pub id: u64,
+    pub proposal: Proposal,
+    pub unlock_time: i64,
+    pub executed: bool,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct RewardSchedule {
+    pub start_time: i64,
+    pub rate: u64,
+    pub duration: i64,
 }
 
 #[account]
@@ -443,4 +627,14 @@ pub enum ErrorCode {
     DivideByZero,
     #[msg("Emergency mode active")]
     EmergencyMode,
+    #[msg("Insufficient signatures")]
+    Unauthorized,
+    #[msg("Proposal not found")]
+    ProposalNotFound,
+    #[msg("Proposal still locked")]
+    ProposalLocked,
+    #[msg("Proposal already executed")]
+    ProposalAlreadyExecuted,
+    #[msg("Maximum proposals exceeded")]
+    ProposalLimit,
 }
