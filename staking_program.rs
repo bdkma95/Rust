@@ -10,6 +10,7 @@ const SCALING_FACTOR: u128 = 1_000_000_000_000_000_000;
 const MAX_ADMINS: usize = 10;
 const MAX_PENDING_PROPOSALS: usize = 5;
 const MAX_REWARD_SCHEDULES: usize = 12;
+const MAX_REWARD_RATE: u64 = 1_000_000; // Adjust based on token decimals
 
 #[program]
 pub mod enterprise_staking {
@@ -107,8 +108,13 @@ pub mod enterprise_staking {
     }
 
     pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
-        let config = &mut ctx.accounts.config;
-        let user_stake = &mut ctx.accounts.user_stake;
+    let config = &mut ctx.accounts.config;
+    let user_stake = &mut ctx.accounts.user_stake;
+    
+    require!(
+        user_stake.withdrawable(config.lockup_period) >= amount,
+        ErrorCode::LockupPeriodActive
+    );
         
         validate_withdrawal(config, user_stake, amount)?;
         update_rewards(config)?;
@@ -157,6 +163,10 @@ pub mod enterprise_staking {
             amount: rewards,
             timestamp: Clock::get()?.unix_timestamp
         });
+        require!(
+        ctx.accounts.rewards_vault.amount >= rewards,
+        ErrorCode::InsufficientRewards
+    )
 
         Ok(())
     }
@@ -273,14 +283,34 @@ impl StakingConfig {
     // Additional methods...
 }
 
+#[account]
+pub struct UserStake {
+    pub user: Pubkey,
+    pub amounts: Vec<u64>,          // Changed from single amount
+    pub deposit_times: Vec<i64>,    // Track time for each deposit
+    pub rewards_earned: u64,
+    pub reward_per_token_complete: u128,
+    pub bump: u8,
+}
+
 impl UserStake {
     pub fn update(&mut self, amount: u64, reward_per_token: u128) -> Result<()> {
-        if self.amount == 0 {
-            self.deposit_time = Clock::get()?.unix_timestamp;
-        }
-        self.amount = self.amount.checked_add(amount).ok_or(ErrorCode::Overflow)?;
+        self.amounts.push(amount);
+        self.deposit_times.push(Clock::get()?.unix_timestamp);
         self.reward_per_token_complete = reward_per_token;
         Ok(())
+    }
+
+    pub fn total_staked(&self) -> u64 {
+        self.amounts.iter().sum()
+    }
+
+    pub fn withdrawable(&self, lockup_period: i64) -> u64 {
+        let current_time = Clock::get().unwrap().unix_timestamp;
+        self.amounts.iter().enumerate()
+            .filter(|(i, _)| current_time >= self.deposit_times[*i] + lockup_period)
+            .map(|(_, amt)| amt)
+            .sum()
     }
 }
 
@@ -292,6 +322,14 @@ impl PendingProposal {
     pub fn is_executable(&self, current_time: i64) -> bool {
         !self.executed && current_time >= self.unlock_time
     }
+}
+
+fn validate_initialization_params(params: &InitializeParams) -> Result<()> {
+    let unique_admins: HashSet<&Pubkey> = params.admins.iter().collect();
+    require!(
+        unique_admins.len() == params.admins.len(),
+        ErrorCode::DuplicateAdmins
+    );
 }
 
 // Enhanced validation functions
@@ -307,9 +345,20 @@ fn validate_proposal(proposal: &Proposal) -> Result<()> {
         Proposal::ScheduleReward { start_time, rate, duration } => 
             validate_reward_schedule(*start_time, *rate, *duration),
         Proposal::UpdateRewardRate(rate) => 
-            require!(*rate > 0, ErrorCode::InvalidRewardRate),
+            require!(*rate > 0, ErrorCode::InvalidRewardRate);
+            require!(*rate <= MAX_REWARD_RATE, ErrorCode::RateLimitExceeded);
         _ => Ok(())
     }
+}
+
+fn validate_proposal_execution(proposal: &PendingProposal) -> Result<()> {
+    let current_time = Clock::get()?.unix_timestamp;
+    require!(
+        current_time >= proposal.unlock_time,
+        ErrorCode::ProposalLocked
+    );
+    require!(!proposal.executed, ErrorCode::ProposalAlreadyExecuted);
+    Ok(())
 }
 
 #[error_code]
@@ -350,4 +399,10 @@ pub enum ErrorCode {
     InvalidStartTime,
     #[msg("Proposal capacity exceeded")]
     ProposalCapacityExceeded,
+    #[msg("Duplicate admins in initialization")]
+    DuplicateAdmins,
+    #[msg("Reward rate exceeds maximum allowed")]
+    RateLimitExceeded,
+    #[msg("Insufficient rewards in vault")]
+    InsufficientRewards,
 }
