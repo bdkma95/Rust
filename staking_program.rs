@@ -6,23 +6,52 @@ use anchor_spl::{
 
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
-const SCALING_FACTOR: u128 = 1_000_000_000_000_000_000; // 1e18 for high precision
+const SCALING_FACTOR: u128 = 1_000_000_000_000_000_000; // 1e18 precision
 
 #[program]
 pub mod staking_program {
     use super::*;
 
+    #[event]
+    pub struct Staked {
+        user: Pubkey,
+        amount: u64,
+        timestamp: i64,
+    }
+
+    #[event]
+    pub struct Withdrawn {
+        user: Pubkey,
+        amount: u64,
+        timestamp: i64,
+    }
+
+    #[event]
+    pub struct RewardClaimed {
+        user: Pubkey,
+        amount: u64,
+        timestamp: i64,
+    }
+
+    #[event]
+    pub struct EmergencyWithdrawal {
+        admin: Pubkey,
+        amount: u64,
+        timestamp: i64,
+    }
+
     pub fn initialize(
         ctx: Context<Initialize>,
         lockup_period: i64,
         reward_rate: u64,
+        reward_duration: i64,
     ) -> Result<()> {
         let config = &mut ctx.accounts.config;
         
-        // Security checks
         require!(ctx.accounts.admin.is_signer, ErrorCode::Unauthorized);
         require!(lockup_period > 0, ErrorCode::InvalidParameter);
         require!(reward_rate > 0, ErrorCode::InvalidParameter);
+        require!(reward_duration > 0, ErrorCode::InvalidParameter);
 
         config.admin = ctx.accounts.admin.key();
         config.staking_token_mint = ctx.accounts.staking_token_mint.key();
@@ -35,35 +64,33 @@ pub mod staking_program {
         config.total_staked = 0;
         config.reward_per_token_stored = 0;
         config.last_update_time = Clock::get()?.unix_timestamp;
-        config.reward_duration_end = 0;
-        
+        config.reward_duration_end = Clock::get()?.unix_timestamp + reward_duration;
+        config.emergency_mode = false;
+
         Ok(())
     }
 
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
-        // Security checks
+        require!(!ctx.accounts.config.emergency_mode, ErrorCode::EmergencyMode);
         require!(amount > 0, ErrorCode::InvalidAmount);
         require!(
             ctx.accounts.user_token_account.mint == ctx.accounts.config.staking_token_mint,
             ErrorCode::InvalidMint
         );
 
-        // Update rewards and user state
         update_rewards(&mut ctx.accounts.config)?;
         update_user_rewards(&mut ctx.accounts.config, &mut ctx.accounts.user_stake)?;
 
         // Transfer tokens
-        anchor_spl::token::transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from: ctx.accounts.user_token_account.to_account_info(),
-                    to: ctx.accounts.staking_vault.to_account_info(),
-                    authority: ctx.accounts.user.to_account_info(),
-                },
-            ),
-            amount,
-        )?;
+        let transfer_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.user_token_account.to_account_info(),
+                to: ctx.accounts.staking_vault.to_account_info(),
+                authority: ctx.accounts.user.to_account_info(),
+            },
+        );
+        anchor_spl::token::transfer(transfer_ctx, amount)?;
 
         // Update stake
         if ctx.accounts.user_stake.amount == 0 {
@@ -71,15 +98,19 @@ pub mod staking_program {
         }
         ctx.accounts.user_stake.amount += amount;
         ctx.accounts.config.total_staked += amount;
-
-        // Update reward tracking
         ctx.accounts.user_stake.reward_per_token_complete = ctx.accounts.config.reward_per_token_stored;
-        
+
+        emit!(Staked {
+            user: ctx.accounts.user.key(),
+            amount,
+            timestamp: Clock::get()?.unix_timestamp
+        });
+
         Ok(())
     }
 
     pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
-        // Security checks
+        require!(!ctx.accounts.config.emergency_mode, ErrorCode::EmergencyMode);
         require!(amount > 0, ErrorCode::InvalidAmount);
         require!(
             ctx.accounts.user_stake.amount >= amount,
@@ -90,7 +121,6 @@ pub mod staking_program {
             ErrorCode::LockupNotEnded
         );
 
-        // Update rewards and user state
         update_rewards(&mut ctx.accounts.config)?;
         update_user_rewards(&mut ctx.accounts.config, &mut ctx.accounts.user_stake)?;
 
@@ -98,32 +128,35 @@ pub mod staking_program {
         let seeds = &[b"config", &[ctx.accounts.config.bump]];
         let signer = &[&seeds[..]];
         
-        anchor_spl::token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from: ctx.accounts.staking_vault.to_account_info(),
-                    to: ctx.accounts.user_staking_ata.to_account_info(),
-                    authority: ctx.accounts.config.to_account_info(),
-                },
-                signer,
-            ),
-            amount,
-        )?;
+        let transfer_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.staking_vault.to_account_info(),
+                to: ctx.accounts.user_staking_ata.to_account_info(),
+                authority: ctx.accounts.config.to_account_info(),
+            },
+            signer,
+        );
+        anchor_spl::token::transfer(transfer_ctx, amount)?;
 
-        // Update stake
         ctx.accounts.user_stake.amount -= amount;
         ctx.accounts.config.total_staked -= amount;
+
+        emit!(Withdrawn {
+            user: ctx.accounts.user.key(),
+            amount,
+            timestamp: Clock::get()?.unix_timestamp
+        });
 
         Ok(())
     }
 
     pub fn claim_rewards(ctx: Context<ClaimRewards>) -> Result<()> {
-        // Update rewards and user state
+        require!(!ctx.accounts.config.emergency_mode, ErrorCode::EmergencyMode);
+
         update_rewards(&mut ctx.accounts.config)?;
         update_user_rewards(&mut ctx.accounts.config, &mut ctx.accounts.user_stake)?;
 
-        // Calculate rewards
         let rewards = ctx.accounts.user_stake.rewards_earned;
         require!(rewards > 0, ErrorCode::NoRewards);
         require!(
@@ -131,69 +164,90 @@ pub mod staking_program {
             ErrorCode::InsufficientRewards
         );
 
-        // Transfer rewards
         let seeds = &[b"config", &[ctx.accounts.config.bump]];
         let signer = &[&seeds[..]];
         
-        anchor_spl::token::transfer(
-            CpiContext::new_with_signer(
+        let transfer_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.rewards_vault.to_account_info(),
+                to: ctx.accounts.user_reward_ata.to_account_info(),
+                authority: ctx.accounts.config.to_account_info(),
+            },
+            signer,
+        );
+        anchor_spl::token::transfer(transfer_ctx, rewards)?;
+
+        ctx.accounts.user_stake.rewards_earned = 0;
+
+        emit!(RewardClaimed {
+            user: ctx.accounts.user.key(),
+            amount: rewards,
+            timestamp: Clock::get()?.unix_timestamp
+        });
+
+        Ok(())
+    }
+
+    pub fn emergency_withdraw(ctx: Context<EmergencyWithdraw>, amount: u64) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        require!(ctx.accounts.admin.key() == config.admin, ErrorCode::Unauthorized);
+        require!(ctx.accounts.admin.is_signer, ErrorCode::Unauthorized);
+        require!(amount > 0, ErrorCode::InvalidAmount);
+
+        let seeds = &[b"config", &[config.bump]];
+        let signer = &[&seeds[..]];
+        
+        // Withdraw from staking vault
+        if amount <= ctx.accounts.staking_vault.amount {
+            let transfer_ctx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.staking_vault.to_account_info(),
+                    to: ctx.accounts.emergency_vault.to_account_info(),
+                    authority: config.to_account_info(),
+                },
+                signer,
+            );
+            anchor_spl::token::transfer(transfer_ctx, amount)?;
+        }
+
+        // Withdraw from rewards vault
+        if amount <= ctx.accounts.rewards_vault.amount {
+            let transfer_ctx = CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 Transfer {
                     from: ctx.accounts.rewards_vault.to_account_info(),
-                    to: ctx.accounts.user_reward_ata.to_account_info(),
-                    authority: ctx.accounts.config.to_account_info(),
+                    to: ctx.accounts.emergency_vault.to_account_info(),
+                    authority: config.to_account_info(),
                 },
                 signer,
-            ),
-            rewards,
-        )?;
+            );
+            anchor_spl::token::transfer(transfer_ctx, amount)?;
+        }
 
-        // Reset earned rewards
-        ctx.accounts.user_stake.rewards_earned = 0;
+        config.emergency_mode = true;
 
+        emit!(EmergencyWithdrawal {
+            admin: ctx.accounts.admin.key(),
+            amount,
+            timestamp: Clock::get()?.unix_timestamp
+        });
+
+        Ok(())
+    }
+
+    pub fn set_emergency_mode(ctx: Context<SetEmergencyMode>, enabled: bool) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        require!(ctx.accounts.admin.key() == config.admin, ErrorCode::Unauthorized);
+        require!(ctx.accounts.admin.is_signer, ErrorCode::Unauthorized);
+        
+        config.emergency_mode = enabled;
         Ok(())
     }
 }
 
-// Reward calculation logic
-fn update_rewards(config: &mut Account<StakingConfig>) -> Result<()> {
-    let current_time = Clock::get()?.unix_timestamp;
-    
-    if current_time > config.last_update_time && config.total_staked > 0 {
-        let time_elapsed = current_time - config.last_update_time;
-        let reward = (time_elapsed as u128)
-            .checked_mul(config.reward_rate as u128)
-            .ok_or(ErrorCode::Overflow)?;
-        
-        config.reward_per_token_stored = config.reward_per_token_stored
-            .checked_add(
-                reward.checked_mul(SCALING_FACTOR)
-                    .ok_or(ErrorCode::Overflow)?
-                    .checked_div(config.total_staked.into())
-                    .ok_or(ErrorCode::DivideByZero)?
-            )
-            .ok_or(ErrorCode::Overflow)?;
-    }
-    
-    config.last_update_time = current_time;
-    Ok(())
-}
-
-fn update_user_rewards(config: &mut Account<StakingConfig>, user: &mut Account<UserStake>) -> Result<()> {
-    let earned = config.reward_per_token_stored
-        .checked_sub(user.reward_per_token_complete)
-        .ok_or(ErrorCode::Overflow)?
-        .checked_mul(user.amount.into())
-        .ok_or(ErrorCode::Overflow)?
-        .checked_div(SCALING_FACTOR)
-        .ok_or(ErrorCode::Overflow)? as u64;
-    
-    user.rewards_earned += earned;
-    user.reward_per_token_complete = config.reward_per_token_stored;
-    Ok(())
-}
-
-// Account definitions and error codes...
+// Helper functions and account definitions...
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
@@ -203,27 +257,140 @@ pub struct Initialize<'info> {
     pub admin: Signer<'info>,
     pub staking_token_mint: Account<'info, Mint>,
     pub reward_token_mint: Account<'info, Mint>,
-    #[account(init, payer = admin, associated_token::mint = staking_token_mint, associated_token::authority = config)]
+    #[account(
+        init,
+        payer = admin,
+        associated_token::mint = staking_token_mint,
+        associated_token::authority = config
+    )]
     pub staking_vault: Account<'info, TokenAccount>,
-    #[account(init, payer = admin, associated_token::mint = reward_token_mint, associated_token::authority = config)]
+    #[account(
+        init,
+        payer = admin,
+        associated_token::mint = reward_token_mint,
+        associated_token::authority = config
+    )]
     pub rewards_vault: Account<'info, TokenAccount>,
-    // ... other necessary accounts
+    #[account(
+        init,
+        payer = admin,
+        associated_token::mint = staking_token_mint,
+        associated_token::authority = admin
+    )]
+    pub emergency_vault: Account<'info, TokenAccount>,
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
 }
 
 #[derive(Accounts)]
 pub struct Deposit<'info> {
-    // ... previous account definitions with security checks
+    #[account(mut, signer)]
+    pub user: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"user_stake", user.key().as_ref()],
+        bump = user_stake.bump
+    )]
+    pub user_stake: Account<'info, UserStake>,
+    #[account(mut,
+        constraint = user_token_account.owner == user.key(),
+        constraint = user_token_account.mint == config.staking_token_mint
+    )]
+    pub user_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub staking_vault: Account<'info, TokenAccount>,
+    #[account(
+        seeds = [b"config"],
+        bump = config.bump,
+        has_one = staking_token_mint,
+        has_one = reward_token_mint
+    )]
+    pub config: Account<'info, StakingConfig>,
+    pub staking_token_mint: Account<'info, Mint>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub clock: Sysvar<'info, Clock>,
 }
 
 #[derive(Accounts)]
 pub struct Withdraw<'info> {
-    // ... previous account definitions with security checks
+    #[account(mut, signer)]
+    pub user: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"user_stake", user.key().as_ref()],
+        bump = user_stake.bump
+    )]
+    pub user_stake: Account<'info, UserStake>,
+    #[account(mut)]
+    pub staking_vault: Account<'info, TokenAccount>,
+    #[account(mut,
+        constraint = user_staking_ata.owner == user.key(),
+        constraint = user_staking_ata.mint == config.staking_token_mint
+    )]
+    pub user_staking_ata: Account<'info, TokenAccount>,
+    #[account(
+        seeds = [b"config"],
+        bump = config.bump,
+        has_one = staking_token_mint
+    )]
+    pub config: Account<'info, StakingConfig>,
+    pub token_program: Program<'info, Token>,
+    pub clock: Sysvar<'info, Clock>,
 }
 
 #[derive(Accounts)]
 pub struct ClaimRewards<'info> {
-    // ... account definitions for claiming rewards
+    #[account(mut, signer)]
+    pub user: Signer<'info>,
+    #[account(mut)]
+    pub user_stake: Account<'info, UserStake>,
+    #[account(mut)]
+    pub rewards_vault: Account<'info, TokenAccount>,
+    #[account(mut,
+        constraint = user_reward_ata.owner == user.key(),
+        constraint = user_reward_ata.mint == config.reward_token_mint
+    )]
+    pub user_reward_ata: Account<'info, TokenAccount>,
+    #[account(
+        seeds = [b"config"],
+        bump = config.bump,
+        has_one = reward_token_mint
+    )]
+    pub config: Account<'info, StakingConfig>,
+    pub token_program: Program<'info, Token>,
+    pub clock: Sysvar<'info, Clock>,
 }
+
+#[derive(Accounts)]
+pub struct EmergencyWithdraw<'info> {
+    #[account(mut, signer)]
+    pub admin: Signer<'info>,
+    #[account(mut)]
+    pub config: Account<'info, StakingConfig>,
+    #[account(mut)]
+    pub staking_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub rewards_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub emergency_vault: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct SetEmergencyMode<'info> {
+    #[account(mut, signer)]
+    pub admin: Signer<'info>,
+    #[account(mut,
+        seeds = [b"config"],
+        bump = config.bump,
+        has_one = admin
+    )]
+    pub config: Account<'info, StakingConfig>,
+}
+
+// Remaining structs and error codes...
 
 #[account]
 pub struct StakingConfig {
@@ -239,6 +406,7 @@ pub struct StakingConfig {
     pub reward_per_token_stored: u128,
     pub last_update_time: i64,
     pub reward_duration_end: i64,
+    pub emergency_mode: bool,
 }
 
 #[account]
@@ -273,4 +441,6 @@ pub enum ErrorCode {
     NoRewards,
     #[msg("Division by zero")]
     DivideByZero,
+    #[msg("Emergency mode active")]
+    EmergencyMode,
 }
