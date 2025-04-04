@@ -142,12 +142,10 @@ pub mod enterprise_staking {
     }
 
     pub fn claim_rewards(ctx: Context<ClaimRewards>) -> Result<()> {
+        let rewards = user_stake.rewards_earned;  // Define first
+        require!(ctx.accounts.rewards_vault.amount >= rewards);
         let config = &mut ctx.accounts.config;
         let user_stake = &mut ctx.accounts.user_stake;
-        require!(
-            ctx.accounts.rewards_vault.amount >= rewards,
-            ErrorCode::InsufficientRewards
-        )
         
         validate_claim(config, user_stake)?;
         update_rewards(config)?;
@@ -297,6 +295,21 @@ pub struct ClaimRewards<'info> {
     pub rewards_vault: Account<'info, TokenAccount>,
 }
 
+// Add vault consistency checks
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    #[account(
+        constraint = staking_vault.mint == config.staking_token_mint,
+        constraint = staking_vault.owner == config.key()
+    )]
+    pub staking_vault: Account<'info, TokenAccount>,
+}
+
+#[account]
+pub struct StakingConfig {
+    pub in_operation: bool,
+}
+
 #[account]
 pub struct UserStake {
     pub user: Pubkey,
@@ -308,27 +321,24 @@ pub struct UserStake {
 }
 
 impl UserStake {
-    pub fn update(&mut self, amount: u64) -> Result<()> {
-        require!(
-            self.amounts.len() < MAX_USER_DEPOSITS,
-            ErrorCode::MaxDepositsExceeded
-        );
-        self.amounts.push(amount);
-        self.deposit_times.push(Clock::get()?.unix_timestamp);
-        self.reward_per_token_complete = reward_per_token;
+    pub fn withdraw(&mut self, amount: u64, lockup: i64) -> Result<()> {
+        let mut remaining = amount;
+        while remaining > 0 {
+            if let Some((idx, &amt)) = self.amounts.iter().enumerate()
+                .find(|(i, _)| Clock::get()?.unix_timestamp >= self.deposit_times[*i] + lockup)
+            {
+                let withdraw_amt = amt.min(remaining);
+                self.amounts[idx] -= withdraw_amt;
+                remaining -= withdraw_amt;
+                if self.amounts[idx] == 0 {
+                    self.amounts.remove(idx);
+                    self.deposit_times.remove(idx);
+                }
+            } else {
+                return Err(ErrorCode::LockupPeriodActive.into());
+            }
+        }
         Ok(())
-    }
-
-    pub fn total_staked(&self) -> u64 {
-        self.amounts.iter().sum()
-    }
-
-    pub fn withdrawable(&self, lockup_period: i64) -> u64 {
-        let current_time = Clock::get().unwrap().unix_timestamp;
-        self.amounts.iter().enumerate()
-            .filter(|(i, _)| current_time >= self.deposit_times[*i] + lockup_period)
-            .map(|(_, amt)| amt)
-            .sum()
     }
 }
 
