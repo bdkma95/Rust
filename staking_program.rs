@@ -495,4 +495,8 @@ pub enum ErrorCode {
     ReentrancyGuard,
     #[msg("Invalid vault ownership")]
     InvalidVaultOwnership,
+    #[msg("Operation in progress")]
+    ReentrancyGuard,
+    #[msg("Maximum deposits exceeded")]
+    MaxDepositsExceeded,
 }
