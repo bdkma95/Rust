@@ -10,8 +10,9 @@ const SCALING_FACTOR: u128 = 1_000_000_000_000_000_000;
 const MAX_ADMINS: usize = 10;
 const MAX_PENDING_PROPOSALS: usize = 5;
 const MAX_REWARD_SCHEDULES: usize = 12;
-const MAX_REWARD_RATE: u64 = 1_000_000; // Adjust based on token decimals
+const MAX_REWARD_RATE: u64 = 1_000_000;
 const MAX_USER_DEPOSITS: usize = 100;
+const MAX_WITHDRAW_ITERATIONS: usize = 10;
 
 #[program]
 pub mod enterprise_staking {
@@ -75,9 +76,7 @@ pub mod enterprise_staking {
             *ctx.accounts.reward_token_mint.key,
             *ctx.accounts.emergency_vault.key,
             ctx.bumps.config,
-        )?;
-
-        Ok(())
+        )
     }
 
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
@@ -97,7 +96,7 @@ pub mod enterprise_staking {
         )?;
 
         config.total_staked = config.total_staked.checked_add(amount).ok_or(ErrorCode::Overflow)?;
-        user_stake.update(amount, config.reward_per_token_stored)?;
+        user_stake.deposit(amount, Clock::get()?.unix_timestamp, config.reward_per_token_stored)?;
 
         emit!(Staked {
             user: ctx.accounts.user.key(),
@@ -109,49 +108,51 @@ pub mod enterprise_staking {
     }
 
     pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
-    let config = &mut ctx.accounts.config;
-    let user_stake = &mut ctx.accounts.user_stake;
-    
-    require!(
-        user_stake.withdrawable(config.lockup_period) >= amount,
-        ErrorCode::LockupPeriodActive
-    );
+        let config = &mut ctx.accounts.config;
+        let user_stake = &mut ctx.accounts.user_stake;
+        let clock = Clock::get()?;
         
-        validate_withdrawal(config, user_stake, amount)?;
+        let withdrawable = user_stake.withdrawable(config.lockup_period, clock.unix_timestamp)?;
+        require!(withdrawable >= amount, ErrorCode::LockupPeriodActive);
+        
         update_rewards(config)?;
         update_user_rewards(config, user_stake)?;
 
+        let withdrawn = user_stake.withdraw(amount, config.lockup_period, clock.unix_timestamp)?;
+        
         transfer_staked_tokens(
-            amount,
+            withdrawn,
             ctx.accounts.staking_vault.to_account_info(),
             ctx.accounts.user_staking_ata.to_account_info(),
             config,
             ctx.accounts.token_program.to_account_info(),
         )?;
 
-        config.total_staked = config.total_staked.checked_sub(amount).ok_or(ErrorCode::Underflow)?;
-        user_stake.amount = user_stake.amount.checked_sub(amount).ok_or(ErrorCode::Underflow)?;
+        config.total_staked = config.total_staked.checked_sub(withdrawn).ok_or(ErrorCode::Underflow)?;
 
         emit!(Withdrawn {
             user: ctx.accounts.user.key(),
-            amount,
-            timestamp: Clock::get()?.unix_timestamp
+            amount: withdrawn,
+            timestamp: clock.unix_timestamp
         });
 
         Ok(())
     }
 
     pub fn claim_rewards(ctx: Context<ClaimRewards>) -> Result<()> {
-        let rewards = user_stake.rewards_earned;  // Define first
-        require!(ctx.accounts.rewards_vault.amount >= rewards);
         let config = &mut ctx.accounts.config;
         let user_stake = &mut ctx.accounts.user_stake;
         
-        validate_claim(config, user_stake)?;
         update_rewards(config)?;
         update_user_rewards(config, user_stake)?;
 
         let rewards = user_stake.rewards_earned;
+        require!(rewards > 0, ErrorCode::NoRewards);
+        require!(
+            ctx.accounts.rewards_vault.amount >= rewards,
+            ErrorCode::InsufficientRewards
+        );
+
         transfer_reward_tokens(
             rewards,
             ctx.accounts.rewards_vault.to_account_info(),
@@ -169,6 +170,7 @@ pub mod enterprise_staking {
 
         Ok(())
     }
+}
 
     pub fn create_proposal(ctx: Context<CreateProposal>, proposal: Proposal) -> Result<()> {
         let config = &mut ctx.accounts.config;
@@ -281,8 +283,6 @@ impl StakingConfig {
 );
         Ok(())
     }
-
-    // Additional methods...
 }
 
 // Add vault ownership verification
@@ -305,40 +305,97 @@ pub struct Withdraw<'info> {
     pub staking_vault: Account<'info, TokenAccount>,
 }
 
+struct ReentrancyGuard<'a, 'info> {
+    config: &'a mut Account<'info, StakingConfig>,
+}
+
+impl<'a, 'info> ReentrancyGuard<'a, 'info> {
+    fn new(config: &'a mut Account<'info, StakingConfig>) -> Result<Self> {
+        require!(!config.in_operation, ErrorCode::ReentrancyGuard);
+        config.in_operation = true;
+        Ok(Self { config })
+    }
+}
+
+impl<'a, 'info> Drop for ReentrancyGuard<'a, 'info> {
+    fn drop(&mut self) {
+        self.config.in_operation = false;
+    }
+}
+
 #[account]
 pub struct StakingConfig {
     pub in_operation: bool,
 }
 
-#[account]
+#[account(zero_copy)]
 pub struct UserStake {
     pub user: Pubkey,
-    pub amounts: Vec<u64>,          // Changed from single amount
-    pub deposit_times: Vec<i64>,    // Track time for each deposit
+    pub amounts: [u64; MAX_USER_DEPOSITS],
+    pub deposit_times: [i64; MAX_USER_DEPOSITS],
+    pub active_deposits: u8,
     pub rewards_earned: u64,
     pub reward_per_token_complete: u128,
     pub bump: u8,
 }
 
 impl UserStake {
-    pub fn withdraw(&mut self, amount: u64, lockup: i64) -> Result<()> {
+    pub fn deposit(&mut self, amount: u64, timestamp: i64, reward_per_token: u128) -> Result<()> {
+        require!((self.active_deposits as usize) < MAX_USER_DEPOSITS, ErrorCode::MaxDepositsExceeded);
+        
+        let index = self.active_deposits as usize;
+        self.amounts[index] = amount;
+        self.deposit_times[index] = timestamp;
+        self.active_deposits += 1;
+        self.reward_per_token_complete = reward_per_token;
+        Ok(())
+    }
+
+    pub fn withdraw(&mut self, amount: u64, lockup: i64, current_time: i64) -> Result<u64> {
         let mut remaining = amount;
-        while remaining > 0 {
-            if let Some((idx, &amt)) = self.amounts.iter().enumerate()
-                .find(|(i, _)| Clock::get()?.unix_timestamp >= self.deposit_times[*i] + lockup)
-            {
-                let withdraw_amt = amt.min(remaining);
-                self.amounts[idx] -= withdraw_amt;
-                remaining -= withdraw_amt;
-                if self.amounts[idx] == 0 {
-                    self.amounts.remove(idx);
-                    self.deposit_times.remove(idx);
-                }
-            } else {
-                return Err(ErrorCode::LockupPeriodActive.into());
+        let mut total_withdrawn = 0;
+        let mut iterations = 0;
+
+        for i in 0..self.active_deposits as usize {
+            if iterations >= MAX_WITHDRAW_ITERATIONS {
+                break;
+            }
+            iterations += 1;
+
+            if self.deposit_times[i] + lockup > current_time {
+                continue;
+            }
+
+            let available = self.amounts[i];
+            if available == 0 {
+                continue;
+            }
+
+            let withdraw_amount = available.min(remaining);
+            self.amounts[i] -= withdraw_amount;
+            remaining -= withdraw_amount;
+            total_withdrawn += withdraw_amount;
+
+            if remaining == 0 {
+                break;
             }
         }
-        Ok(())
+
+        if remaining > 0 {
+            return Err(ErrorCode::InsufficientStakedAmount.into());
+        }
+
+        Ok(total_withdrawn)
+    }
+
+    pub fn withdrawable(&self, lockup: i64, current_time: i64) -> Result<u64> {
+        let mut total = 0;
+        for i in 0..self.active_deposits as usize {
+            if self.deposit_times[i] + lockup <= current_time {
+                total += self.amounts[i];
+            }
+        }
+        Ok(total)
     }
 }
 
