@@ -331,12 +331,12 @@ pub struct StakingConfig {
 #[account(zero_copy)]
 pub struct UserStake {
     pub user: Pubkey,
-    pub amounts: [u64; MAX_USER_DEPOSITS],
-    pub deposit_times: [i64; MAX_USER_DEPOSITS],
-    pub active_deposits: u8,
     pub rewards_earned: u64,
     pub reward_per_token_complete: u128,
     pub bump: u8,
+    amounts: [u64; MAX_USER_DEPOSITS],
+    deposit_times: [i64; MAX_USER_DEPOSITS],
+    active_deposits: u8,
 }
 
 impl UserStake {
