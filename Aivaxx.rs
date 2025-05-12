@@ -4,7 +4,7 @@ use anchor_spl::token::{self, Mint, TokenAccount};
 declare_id!("YourProgramID");
 
 #[program]
-pub mod antivaxxx {
+pub mod Aivaxx {
     use super::*;
 
     pub fn initialize(ctx: Context<Initialize>, total_supply: u64, cliff_duration: i64, duration: i64) -> ProgramResult {
