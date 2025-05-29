@@ -5,14 +5,28 @@ use solana_program::{
     program_error::ProgramError,
     pubkey::Pubkey,
     msg,
+    sysvar::{rent::Rent, Sysvar},
+    program_pack::Pack,
 };
 use spl_token::{
-    instruction::{initialize_account, initialize_mint, mint_to, burn, transfer},
+    instruction::{initialize_mint, mint_to, burn, transfer},
     state::{Account, Mint},
 };
+use spl_token::error::TokenError;
+use borsh::{BorshSerialize, BorshDeserialize};
 
 // Program entry point
 entrypoint!(process_instruction);
+
+// Metadata structure for token
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
+pub struct TokenMetadata {
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,        // URL to additional metadata
+    pub tax_rate: u8,       // 0-100 percentage
+    pub treasury: Pubkey,   // Treasury account for tax collection
+}
 
 pub fn process_instruction(
     program_id: &Pubkey,
@@ -20,45 +34,103 @@ pub fn process_instruction(
     instruction_data: &[u8],
 ) -> ProgramResult {
     match instruction_data[0] {
-        0 => initialize_token(program_id, accounts),
-        1 => mint_tokens(accounts, instruction_data),
-        2 => transfer_tokens(accounts, instruction_data),
-        3 => burn_tokens(accounts, instruction_data),
+        0 => initialize_token(program_id, accounts, &instruction_data[1..]),
+        1 => mint_tokens(program_id, accounts, &instruction_data[1..]),
+        2 => transfer_tokens(program_id, accounts, &instruction_data[1..]),
+        3 => burn_tokens(program_id, accounts, &instruction_data[1..]),
+        4 => update_metadata(program_id, accounts, &instruction_data[1..]),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
 
-// Initialize token mint
-fn initialize_token(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+// Initialize token mint with metadata
+fn initialize_token(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let mint_account = next_account_info(accounts_iter)?;
+    let metadata_account = next_account_info(accounts_iter)?;
+    let payer = next_account_info(accounts_iter)?;
     let rent = next_account_info(accounts_iter)?;
+    let system_program = next_account_info(accounts_iter)?;
+    let token_program = next_account_info(accounts_iter)?;
     
-    // Initialize mint with 9 decimals (common for meme coins)
+    // Verify accounts
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    
+    // Deserialize metadata
+    let metadata = TokenMetadata::try_from_slice(data)?;
+    
+    // Validate tax rate
+    if metadata.tax_rate > 20 {
+        return Err(TokenError::InvalidMintAuthority.into());
+    }
+    
+    // Initialize mint
     initialize_mint(
-        &spl_token::id(),
+        token_program.key,
         mint_account,
-        program_id,
-        Some(program_id),
-        9,
+        payer.key,      // Mint authority
+        Some(payer.key),// Freeze authority
+        9,              // Decimals
     )?;
     
-    msg!("Token mint initialized successfully!");
+    // Create and save metadata
+    let metadata_data = metadata.try_to_vec()?;
+    let rent_amount = Rent::get()?.minimum_balance(metadata_data.len());
+    
+    **payer.try_borrow_mut_lamports()? -= rent_amount;
+    **metadata_account.try_borrow_mut_lamports()? += rent_amount;
+    
+    metadata_account.assign(system_program.key);
+    metadata_account.realloc(metadata_data.len(), false)?;
+    metadata_account.try_borrow_mut_data()?.copy_from_slice(&metadata_data);
+    
+    msg!(
+        "Token initialized: {} ({}) with {}% tax",
+        metadata.name,
+        metadata.symbol,
+        metadata.tax_rate
+    );
     Ok(())
 }
 
-// Mint new tokens
-fn mint_tokens(accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {
+// Mint new tokens with authority check
+fn mint_tokens(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let mint_account = next_account_info(accounts_iter)?;
     let token_account = next_account_info(accounts_iter)?;
     let authority = next_account_info(accounts_iter)?;
+    let metadata_account = next_account_info(accounts_iter)?;
+    let token_program = next_account_info(accounts_iter)?;
+    
+    // Verify authority
+    if !authority.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
     
     // Get amount from instruction data
-    let amount = u64::from_le_bytes(instruction_data[1..9].try_into().unwrap());
+    let amount = u64::from_le_bytes(data[..8].try_into().unwrap());
+    
+    // Load metadata to verify authority
+    let metadata = TokenMetadata::try_from_slice(&metadata_account.try_borrow_data()?)?;
+    
+    // Check if authority is valid
+    let mint_data = Mint::unpack(&mint_account.try_borrow_data()?)?;
+    if mint_data.mint_authority != COption::Some(*authority.key) {
+        return Err(TokenError::OwnerMismatch.into());
+    }
     
     mint_to(
-        &spl_token::id(),
+        token_program.key,
         mint_account,
         token_account,
         authority,
@@ -70,41 +142,88 @@ fn mint_tokens(accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResu
     Ok(())
 }
 
-// Transfer tokens between accounts
-fn transfer_tokens(accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {
+// Transfer tokens with tax mechanism
+fn transfer_tokens(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let source = next_account_info(accounts_iter)?;
     let destination = next_account_info(accounts_iter)?;
     let owner = next_account_info(accounts_iter)?;
+    let mint = next_account_info(accounts_iter)?;
+    let treasury = next_account_info(accounts_iter)?;
+    let metadata_account = next_account_info(accounts_iter)?;
+    let token_program = next_account_info(accounts_iter)?;
+    
+    // Verify owner
+    if !owner.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
     
     // Get amount from instruction data
-    let amount = u64::from_le_bytes(instruction_data[1..9].try_into().unwrap());
+    let amount = u64::from_le_bytes(data[..8].try_into().unwrap());
     
+    // Load metadata
+    let metadata = TokenMetadata::try_from_slice(&metadata_account.try_borrow_data()?)?;
+    
+    // Calculate tax and net amount
+    let tax_amount = (amount * metadata.tax_rate as u64) / 100;
+    let net_amount = amount - tax_amount;
+    
+    // Transfer net amount to recipient
     transfer(
-        &spl_token::id(),
+        token_program.key,
         source,
         destination,
         owner,
         &[],
-        amount,
+        net_amount,
     )?;
     
-    msg!("Transferred {} tokens", amount);
+    // Transfer tax to treasury
+    if tax_amount > 0 {
+        transfer(
+            token_program.key,
+            source,
+            treasury,
+            owner,
+            &[],
+            tax_amount,
+        )?;
+    }
+    
+    msg!(
+        "Transferred {} tokens ({} tax to treasury)",
+        net_amount,
+        tax_amount
+    );
     Ok(())
 }
 
 // Burn tokens
-fn burn_tokens(accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {
+fn burn_tokens(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let account = next_account_info(accounts_iter)?;
     let mint = next_account_info(accounts_iter)?;
     let authority = next_account_info(accounts_iter)?;
+    let token_program = next_account_info(accounts_iter)?;
+    
+    // Verify authority
+    if !authority.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
     
     // Get amount from instruction data
-    let amount = u64::from_le_bytes(instruction_data[1..9].try_into().unwrap());
+    let amount = u64::from_le_bytes(data[..8].try_into().unwrap());
     
     burn(
-        &spl_token::id(),
+        token_program.key,
         account,
         mint,
         authority,
@@ -113,5 +232,35 @@ fn burn_tokens(accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResu
     )?;
     
     msg!("Burned {} tokens", amount);
+    Ok(())
+}
+
+// Update token metadata
+fn update_metadata(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let metadata_account = next_account_info(accounts_iter)?;
+    let authority = next_account_info(accounts_iter)?;
+    let mint = next_account_info(accounts_iter)?;
+    
+    // Verify authority
+    if !authority.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    
+    // Check authority matches mint authority
+    let mint_data = Mint::unpack(&mint.try_borrow_data()?)?;
+    if mint_data.mint_authority != COption::Some(*authority.key) {
+        return Err(TokenError::OwnerMismatch.into());
+    }
+    
+    // Update metadata
+    let new_metadata = TokenMetadata::try_from_slice(data)?;
+    metadata_account.try_borrow_mut_data()?.copy_from_slice(&new_metadata.try_to_vec()?);
+    
+    msg!("Metadata updated");
     Ok(())
 }
