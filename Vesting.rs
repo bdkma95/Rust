@@ -1,367 +1,349 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, TokenAccount};
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+use crate::ErrorCode;
 
 declare_id!("YourProgramID");
 
 #[program]
-pub mod Aivaxx {
+pub mod aivaxx {
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>, total_supply: u64, cliff_duration: i64, duration: i64) -> ProgramResult {
-        let user_account = &mut ctx.accounts.user_account;
-    
-        // Validate cliff duration and duration
-        if cliff_duration < 0 || duration <= 0 || cliff_duration >= duration {
-            return Err(ErrorCode::InvalidValues.into()); // Invalid cliff/duration setup
-        }
-    
-        user_account.allocated_tokens = total_supply;
-        user_account.vested_tokens = 0;
-    
-        // Mint the total supply to the user's token account
-        let authority_bump = *ctx.bumps.get("authority").unwrap();
-    
+    // Initialize vesting program
+    pub fn initialize(
+        ctx: Context<Initialize>,
+        total_supply: u64,
+        cliff_duration: i64,
+        vesting_duration: i64,
+    ) -> Result<()> {
+        // Validate vesting parameters
+        require!(cliff_duration >= 0, ErrorCode::InvalidCliff);
+        require!(vesting_duration > 0, ErrorCode::InvalidDuration);
+        require!(cliff_duration < vesting_duration, ErrorCode::InvalidCliffDuration);
+
+        let state = &mut ctx.accounts.state;
+        let clock = Clock::get()?;
+        
+        // Set up global state
+        state.mint = ctx.accounts.mint.key();
+        state.treasury = ctx.accounts.treasury.key();
+        state.authority = ctx.accounts.authority.key();
+        state.total_supply = total_supply;
+        state.cliff_duration = cliff_duration;
+        state.vesting_duration = vesting_duration;
+        state.start_time = clock.unix_timestamp;
+
+        // Mint tokens to treasury
+        let seeds = &[
+            b"authority", 
+            &[*ctx.bumps.get("authority").unwrap()]
+        ];
+        let signer = &[&seeds[..]];
+        
         token::mint_to(
-            ctx.accounts.into_mint_to_context(authority_bump),
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                token::MintTo {
+                    mint: ctx.accounts.mint.to_account_info(),
+                    to: ctx.accounts.treasury.to_account_info(),
+                    authority: ctx.accounts.authority.to_account_info(),
+                },
+                signer,
+            ),
             total_supply,
         )?;
-    
-        Ok(())
-    }            
-
-    pub fn vest_tokens(ctx: Context<VestTokens>, amount: u64) -> ProgramResult {
-        let user_account = &mut ctx.accounts.user_account;
-    
-        // Ensure the amount to vest does not exceed allocated tokens
-        if amount > user_account.allocated_tokens - user_account.vested_tokens {
-            return Err(ErrorCode::InsufficientTokens.into());
-        }
-    
-        // Ensure the source account has enough tokens to transfer
-        let from_balance = ctx.accounts.from.amount;
-        if from_balance < amount {
-            return Err(ErrorCode::InsufficientBalance.into());
-        }
-    
-        // Update vested tokens
-        user_account.vested_tokens += amount;
-    
-        // Transfer tokens to the user's account
-        token::transfer(
-            ctx.accounts.into_transfer_context(),
-            amount, // Transfer the requested vesting amount
-        )?;
-    
-        Ok(())
-    }       
-
-    pub fn release_founder_tokens(ctx: Context<ReleaseTokens>, current_time: i64) -> ProgramResult {
-        let founder = &mut ctx.accounts.founder;
-        let releasable_amount = founder.vesting_schedule.release(current_time)?;
-
-        if releasable_amount > 0 {
-            token::transfer(
-                ctx.accounts.into_transfer_context(),
-                releasable_amount,
-            )?;
-        }
 
         Ok(())
     }
 
-    pub fn release_advisor_tokens(ctx: Context<ReleaseTokens>, current_time: i64) -> ProgramResult {
-        let advisor = &mut ctx.accounts.advisor;
-        let releasable_amount = advisor.vesting_schedule.release(current_time)?;
+    // Add a new beneficiary to the vesting program
+    pub fn add_beneficiary(
+        ctx: Context<AddBeneficiary>,
+        beneficiary: Pubkey,
+        allocation: u64,
+        user_type: UserType,
+    ) -> Result<()> {
+        let state = &ctx.accounts.state;
+        let beneficiary_account = &mut ctx.accounts.beneficiary;
+        
+        // Validate allocation
+        require!(allocation > 0, ErrorCode::InvalidAllocation);
+        require!(
+            state.total_supply >= allocation,
+            ErrorCode::InsufficientSupply
+        );
 
-        if releasable_amount > 0 {
-            token::transfer(
-                ctx.accounts.into_transfer_context(),
-                releasable_amount,
-            )?;
-        }
+        // Initialize beneficiary
+        beneficiary_account.user = beneficiary;
+        beneficiary_account.allocation = allocation;
+        beneficiary_account.released = 0;
+        beneficiary_account.user_type = user_type;
+        beneficiary_account.start_time = state.start_time;
+        beneficiary_account.cliff_duration = state.cliff_duration;
+        beneficiary_account.vesting_duration = state.vesting_duration;
+
+        Ok(())
+    }
+
+    // Release vested tokens to a beneficiary
+    pub fn release(ctx: Context<Release>) -> Result<()> {
+        let beneficiary = &mut ctx.accounts.beneficiary;
+        let clock = Clock::get()?;
+        let current_time = clock.unix_timestamp;
+
+        // Calculate releasable amount
+        let releasable = beneficiary.releasable_amount(current_time)?;
+        require!(releasable > 0, ErrorCode::NoTokensAvailable);
+
+        // Update beneficiary state
+        beneficiary.released = beneficiary.released.checked_add(releasable)
+            .ok_or(ErrorCode::OverflowError)?;
+
+        // Transfer tokens
+        let seeds = &[
+            b"authority", 
+            &[*ctx.bumps.get("authority").unwrap()]
+        ];
+        let signer = &[&seeds[..]];
+        
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.treasury.to_account_info(),
+                    to: ctx.accounts.beneficiary_token_account.to_account_info(),
+                    authority: ctx.accounts.authority.to_account_info(),
+                },
+                signer,
+            ),
+            releasable,
+        )?;
+
+        // Emit event
+        emit!(ReleaseEvent {
+            beneficiary: beneficiary.user,
+            amount: releasable,
+            timestamp: current_time,
+            user_type: beneficiary.user_type,
+        });
 
         Ok(())
     }
 }
 
+// Account Structures
+#[account]
+pub struct VestingState {
+    pub mint: Pubkey,            // Token mint address
+    pub treasury: Pubkey,         // Treasury token account
+    pub authority: Pubkey,        // Program authority (PDA)
+    pub total_supply: u64,        // Total token supply
+    pub cliff_duration: i64,      // Cliff duration in seconds
+    pub vesting_duration: i64,    // Total vesting duration in seconds
+    pub start_time: i64,          // Program start timestamp
+}
+
+#[account]
+pub struct Beneficiary {
+    pub user: Pubkey,             // Beneficiary wallet address
+    pub allocation: u64,          // Total allocated tokens
+    pub released: u64,            // Tokens already released
+    pub user_type: UserType,      // Founder/Advisor/Team
+    pub start_time: i64,          // Vesting start time
+    pub cliff_duration: i64,      // Cliff duration in seconds
+    pub vesting_duration: i64,    // Total vesting duration in seconds
+}
+
+// User Type Enum
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
+pub enum UserType {
+    Founder,
+    Advisor,
+    Team,
+}
+
+// Contexts
 #[derive(Accounts)]
 pub struct Initialize<'info> {
     #[account(
         init,
         payer = payer,
-        mint::decimals = 9, // Specify token decimals (e.g., 9 for 1 token = 1e9 units)
-        mint::authority = authority, // PDA or other authority
-        mint::freeze_authority = authority // Optional freeze authority
+        space = 8 + VestingState::LEN,
+        seeds = [b"state"],
+        bump
+    )]
+    pub state: Account<'info, VestingState>,
+    
+    #[account(
+        init,
+        payer = payer,
+        mint::decimals = 9,
+        mint::authority = authority,
+        mint::freeze_authority = authority
     )]
     pub mint: Account<'info, Mint>,
     
-    #[account(init, payer = payer, space = 8 + std::mem::size_of::<User>())]
-    pub user_account: Account<'info, User>,
-
-    /// CHECK: This is a PDA authority
-    #[account(seeds = [b"authority"], bump)]
-    pub authority: UncheckedAccount<'info>, // PDA acting as mint authority
-
-    #[account(mut)]
-    pub payer: Signer<'info>, // Transaction payer
-
-    #[account(address = token::ID)]
-    pub token_program: Program<'info, Token>,
+    #[account(
+        init,
+        payer = payer,
+        token::mint = mint,
+        token::authority = authority
+    )]
+    pub treasury: Account<'info, TokenAccount>,
     
+    /// PDA authority
+    #[account(
+        seeds = [b"authority"],
+        bump
+    )]
+    pub authority: AccountInfo<'info>,
+    
+    #[account(mut)]
+    pub payer: Signer<'info>,
     pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
     pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
-pub struct VestTokens<'info> {
-    pub user_account: Account<'info, User>,
-    #[account(mut)]
-    pub from: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub to: Account<'info, TokenAccount>,
-    #[account(address = token::ID)]
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct ReleaseFounderTokens<'info> {
-    #[account(mut)]
-    pub founder: Account<'info, Founder>,
-    #[account(mut)]
-    pub from: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub to: Account<'info, TokenAccount>,
-    #[account(address = token::ID)]
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct ReleaseAdvisorTokens<'info> {
-    #[account(mut)]
-    pub advisor: Account<'info, Advisor>,
-    #[account(mut)]
-    pub from: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub to: Account<'info, TokenAccount>,
-    #[account(address = token::ID)]
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct ReleaseTokens<'info> {
-    #[account(mut)]
-    pub from: Account<'info, TokenAccount>, // Source account (tokens to be released)
-    #[account(mut)]
-    pub to: Account<'info, TokenAccount>, // Destination account (where tokens are transferred)
+pub struct AddBeneficiary<'info> {
+    #[account(
+        mut,
+        has_one = authority @ ErrorCode::Unauthorized,
+        seeds = [b"state"],
+        bump
+    )]
+    pub state: Account<'info, VestingState>,
     
-    #[account(address = token::ID)]
-    pub token_program: Program<'info, Token>, // Token program used for transfers
-
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + Beneficiary::LEN,
+        seeds = [b"beneficiary", user.key().as_ref()],
+        bump
+    )]
+    pub beneficiary: Account<'info, Beneficiary>,
+    
+    /// CHECK: User wallet address
+    pub user: AccountInfo<'info>,
+    
+    #[account(mut)]
+    pub payer: Signer<'info>,
     pub system_program: Program<'info, System>,
 }
 
-#[account]
-pub struct VestingSchedule {
-    pub start_time: i64,        // Start time for vesting
-    pub cliff_duration: i64,    // Duration of the cliff period (tokens cannot be released)
-    pub duration: i64,          // Duration over which the tokens vest
-    pub total_amount: u64,      // Total amount of tokens to be vested
-    pub released_amount: u64,   // Amount of tokens already released
+#[derive(Accounts)]
+pub struct Release<'info> {
+    #[account(
+        mut,
+        has_one = authority @ ErrorCode::Unauthorized,
+        seeds = [b"state"],
+        bump
+    )]
+    pub state: Account<'info, VestingState>,
+    
+    #[account(
+        mut,
+        seeds = [b"beneficiary", beneficiary.user.key().as_ref()],
+        bump
+    )]
+    pub beneficiary: Account<'info, Beneficiary>,
+    
+    #[account(
+        mut,
+        associated_token::mint = state.mint,
+        associated_token::authority = beneficiary.user
+    )]
+    pub beneficiary_token_account: Account<'info, TokenAccount>,
+    
+    #[account(
+        mut,
+        address = state.treasury,
+        token::mint = state.mint,
+        token::authority = authority
+    )]
+    pub treasury: Account<'info, TokenAccount>,
+    
+    /// PDA authority
+    #[account(
+        seeds = [b"authority"],
+        bump
+    )]
+    pub authority: AccountInfo<'info>,
+    
+    pub token_program: Program<'info, Token>,
+    pub clock: Sysvar<'info, Clock>,
 }
 
-#[account]
-pub struct Founder {
-    pub user_account: Pubkey,
-    pub vesting_schedule: VestingSchedule,
-}
-
-#[account]
-pub struct Advisor {
-    pub user_account: Pubkey,
-    pub vesting_schedule: VestingSchedule,
-}
-
-#[account]
-pub struct User {
-    pub allocated_tokens: u64,
-    pub vested_tokens: u64,
-}
-
+// Error Codes
 #[error_code]
 pub enum ErrorCode {
-    #[msg("Insufficient tokens available for vesting.")]
-    InsufficientTokens,
-
-    #[msg("The duration cannot be zero.")]
+    #[msg("Invalid cliff duration")]
+    InvalidCliff,
+    #[msg("Invalid vesting duration")]
     InvalidDuration,
-
-    #[msg("Insufficient balance in the source account.")]
-    InsufficientBalance,
-
-    #[msg("No tokens available for release.")]
+    #[msg("Cliff must be shorter than vesting duration")]
+    InvalidCliffDuration,
+    #[msg("Invalid token allocation")]
+    InvalidAllocation,
+    #[msg("Insufficient token supply")]
+    InsufficientSupply,
+    #[msg("No tokens available for release")]
     NoTokensAvailable,
-
-    #[msg("Invalid values in vesting schedule.")]
-    InvalidValues, // New error for invalid values in vesting schedule
-
-    #[msg("Overflow error in vesting schedule calculation.")]
-    OverflowError, // New error for overflow situations
+    #[msg("Unauthorized operation")]
+    Unauthorized,
+    #[msg("Arithmetic overflow")]
+    OverflowError,
 }
 
+// Events
 #[event]
-pub struct VestTokensEvent {
+pub struct ReleaseEvent {
     pub beneficiary: Pubkey,
     pub amount: u64,
-}
-
-#[event]
-pub struct ReleaseTokensEvent {
-    pub beneficiary: Pubkey,
-    pub released_amount: u64,
     pub timestamp: i64,
+    pub user_type: UserType,
 }
 
-pub enum UserType {
-    Founder,
-    Advisor,
-}
+// Implementation for Beneficiary
+impl Beneficiary {
+    const LEN: usize = 32 + 8 + 8 + 1 + 8 + 8 + 8;
 
-pub fn release_tokens(
-    ctx: Context<ReleaseTokens>,
-    user_type: UserType,
-    current_time: i64,
-) -> ProgramResult {
-    let (vesting_schedule, beneficiary) = match user_type {
-        UserType::Founder => {
-            let founder = &mut ctx.accounts.founder;
-            (&mut founder.vesting_schedule, founder.key())
-        }
-        UserType::Advisor => {
-            let advisor = &mut ctx.accounts.advisor;
-            (&mut advisor.vesting_schedule, advisor.key())
-        }
-    };
-
-    // Ensure the vesting schedule is valid
-    if vesting_schedule.total_amount == 0 || vesting_schedule.duration <= 0 {
-        return Err(ErrorCode::InvalidValues.into()); // Handle invalid vesting schedule data
-    }
-
-    // Calculate the releasable amount of tokens
-    let releasable_amount = vesting_schedule.release(current_time)?;
-
-    // If no tokens are available for release, return an error
-    if releasable_amount == 0 {
-        return Err(ErrorCode::NoTokensAvailable.into());
-    }
-
-    // Ensure the source account has enough tokens to release
-    let from_balance = ctx.accounts.from.amount;
-    if from_balance < releasable_amount {
-        return Err(ErrorCode::InsufficientBalance.into());
-    }
-
-    // Ensure that the released amount doesn't exceed the total vested amount
-    if vesting_schedule.released_amount + releasable_amount > vesting_schedule.total_amount {
-        return Err(ErrorCode::InvalidValues.into()); // Release would exceed the total vested amount
-    }
-
-    // Perform the transfer of tokens from 'from' account to 'to' account
-    token::transfer(ctx.accounts.into_transfer_context(), releasable_amount)?;
-
-    // Update the released amount in the vesting schedule
-    vesting_schedule.released_amount = vesting_schedule.released_amount.saturating_add(releasable_amount);
-
-    // Emit an event to track the release
-    emit!(ReleaseTokensEvent {
-        beneficiary,
-        released_amount: releasable_amount,
-        timestamp: current_time,
-    });
-
-    Ok(())
-}
-
-impl Initialize<'_> {
-    fn into_mint_to_context(&self, authority_bump: u8) -> CpiContext<'_, '_, '_, 'info, MintTo<'info>> {
-        let cpi_accounts = MintTo {
-            mint: self.mint.to_account_info(),
-            to: self.user_account.to_account_info(),
-            authority: self.authority.to_account_info(), // Use PDA for authority
-        };
-
-        // Include the bump in the signer list for the `with_signer` method
-        let signer_seeds = &[b"authority", &[authority_bump]];
-
-        CpiContext::new(self.token_program.to_account_info(), cpi_accounts)
-            .with_signer(&signer_seeds)
-    }
-}
-
-impl VestTokens<'_> {
-    fn into_transfer_context(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
-        let cpi_accounts = Transfer {
-            from: self.from.to_account_info(),
-            to: self.to.to_account_info(),
-            authority: self.user_account.to_account_info(), // Assuming user is the authority
-        };
-        CpiContext::new(self.token_program.to_account_info(), cpi_accounts)
-    }
-}
-
-impl VestingSchedule {
-    pub fn release(&mut self, current_time: i64) -> Result<u64, ProgramError> {
-        // Ensure that the duration is never zero to avoid division by zero
-        if self.duration == 0 {
-            return Err(ErrorCode::InvalidDuration.into()); // Return an error if duration is zero
+    // Calculate releasable tokens
+    pub fn releasable_amount(&self, current_time: i64) -> Result<u64> {
+        // Check if vesting has started
+        if current_time < self.start_time {
+            return Ok(0);
         }
 
-        // Ensure that values are logically valid (non-negative)
-        if self.total_amount < 0 || self.duration < 0 || self.start_time < 0 || self.cliff_duration < 0 {
-            return Err(ErrorCode::InvalidValues.into()); // Invalid values for vesting schedule
+        // Calculate elapsed time
+        let elapsed = current_time
+            .checked_sub(self.start_time)
+            .ok_or(ErrorCode::OverflowError)?;
+
+        // Check cliff period
+        if elapsed < self.cliff_duration {
+            return Ok(0);
         }
 
-        // Ensure that the vesting schedule is only updated in one place
-        if current_time < self.start_time + self.cliff_duration {
-            return Ok(0); // Cliff period not reached
-        }
-
-        let elapsed_time = current_time - self.start_time;
-
-        // Ensure elapsed_time does not become negative (it shouldn't, but it's good to check)
-        if elapsed_time < 0 {
-            return Err(ErrorCode::InvalidValues.into()); // Negative elapsed time, invalid state
-        }
-
-        // Ensure the total_amount and duration are within safe limits to avoid overflow
-        if self.total_amount == 0 || self.duration == 0 {
-            return Err(ErrorCode::InvalidValues.into());
-        }
-
-        // Calculate the total amount that should have been vested based on elapsed time
-        let vested_amount = if elapsed_time >= self.duration {
-            self.total_amount
+        // Calculate vested amount
+        let vested = if elapsed >= self.vesting_duration {
+            self.allocation
         } else {
-            // Safely calculate vested amount without overflow
-            let result = self.total_amount
-                .checked_mul(elapsed_time as u64)
-                .and_then(|x| x.checked_div(self.duration as u64));
-            
-            match result {
-                Some(amount) => amount,
-                None => {
-                    // If multiplication or division results in overflow, return an error
-                    return Err(ErrorCode::OverflowError.into());
-                }
-            }
+            self.allocation
+                .checked_mul(elapsed as u64)
+                .ok_or(ErrorCode::OverflowError)?
+                .checked_div(self.vesting_duration as u64)
+                .ok_or(ErrorCode::OverflowError)?
         };
 
-        // Ensure that the released amount does not exceed the vested amount
-        let releasable_amount = vested_amount.saturating_sub(self.released_amount);
-
-        // Update the released amount atomically
-        self.released_amount = self.released_amount.saturating_add(releasable_amount);
-
-        Ok(releasable_amount)
+        // Calculate releasable amount
+        vested
+            .checked_sub(self.released)
+            .ok_or(ErrorCode::OverflowError)
     }
+}
+
+// Implementation for VestingState
+impl VestingState {
+    const LEN: usize = 32 + 32 + 32 + 8 + 8 + 8 + 8;
 }
